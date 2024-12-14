@@ -13,7 +13,7 @@ updates:
         dependency-type: development
       prod:
         dependency-type: production
-    package-ecosystem: pip
+    package-ecosystem: pip, npm
     schedule:
       interval: weekly
 version: 2
