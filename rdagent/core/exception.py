@@ -1,4 +1,16 @@
-class CoderError(Exception):
+class WorkflowError(Exception):
+    """
+    Exception indicating an error that the current loop cannot handle, preventing further progress.
+    """
+
+
+class FormatError(WorkflowError):
+    """
+    After multiple attempts, we are unable to obtain the answer in the correct format to proceed.
+    """
+
+
+class CoderError(WorkflowError):
     """
     Exceptions raised when Implementing and running code.
     - start: FactorTask => FactorGenerator
@@ -6,6 +18,8 @@ class CoderError(Exception):
 
     The more detailed evaluation in dataframe values are managed by the evaluator.
     """
+
+    # NOTE: it corresponds to the error of **component**
 
 
 class CodeFormatError(CoderError):
@@ -26,10 +40,12 @@ class NoOutputError(CoderError):
     """
 
 
-class CustomRunnerError(Exception):
+class RunnerError(Exception):
     """
     Exceptions raised when running the code output.
     """
+
+    # NOTE: it corresponds to the error of whole **project**
 
 
 class FactorEmptyError(Exception):
