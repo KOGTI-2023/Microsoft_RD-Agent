@@ -1,28 +1,18 @@
 import json
-import re
-from typing import Literal
-
-import pandas as pd
 
 from rdagent.components.coder.data_science.ensemble.exp import EnsembleTask
 from rdagent.components.coder.data_science.feature.exp import FeatureTask
 from rdagent.components.coder.data_science.model.exp import ModelTask
 from rdagent.components.coder.data_science.raw_data_loader.exp import DataLoaderTask
 from rdagent.components.coder.data_science.workflow.exp import WorkflowTask
-from rdagent.core.experiment import Experiment, Workspace
 from rdagent.core.knowledge_base import KnowledgeBase
-from rdagent.core.proposal import (
-    ExperimentFeedback,
-    ExpGen,
-    Hypothesis,
-    HypothesisFeedback,
-    Trace,
-)
+from rdagent.core.proposal import ExperimentFeedback, ExpGen, Hypothesis, Trace
 from rdagent.oai.llm_utils import APIBackend
 from rdagent.scenarios.data_science.experiment.experiment import COMPONENT, DSExperiment
 from rdagent.scenarios.data_science.scen import DataScienceScen
 from rdagent.utils.agent.tpl import T
-from rdagent.utils.repo.diff import generate_diff
+from rdagent.utils.repo.diff import generate_diff_from_dict
+from rdagent.utils.workflow import wait_retry
 
 
 class DSHypothesis(Hypothesis):
@@ -133,6 +123,15 @@ class DSTrace(Trace[DataScienceScen, KnowledgeBase]):
                 return exp
         return None
 
+    def last_runnable_exp_fb(self) -> tuple[DSExperiment, ExperimentFeedback] | None:
+        """
+        Access the last runnable experiment (no exception, usually not all task failed) and feedback
+        """
+        for exp, ef in self.hist[::-1]:
+            if ef.exception is None:
+                return exp, ef
+        return None
+
 
 class DSExpGen(ExpGen):
     """Data Science Task Generator."""
@@ -196,18 +195,10 @@ class DSExpGen(ExpGen):
         """
         former_task_desc = (
             trace.hist[-1][0].pending_tasks_list[0][0].get_task_information()
-            if len(trace.hist) > 0 and trace.hist[-1] is not last_successful_exp
+            if len(trace.hist) > 0 and trace.hist[-1][0] is not last_successful_exp
             else None
         )
-        resp_dict = self._init_task_gen(
-            targets=component,
-            scenario_desc=scenario_desc,
-            spec=last_successful_exp.experiment_workspace.file_dict[spec_file] if spec_file else None,
-            task_output_format=T(f".prompts:output_format.{component_prompt_key or component.lower()}").r(),
-            former_task=former_task_desc,
-        )
 
-        # Create task instance
         exp_and_feedback = trace.hist[-1] if len(trace.hist) > 0 else None
         if (
             exp_and_feedback
@@ -218,14 +209,23 @@ class DSExpGen(ExpGen):
                 and component == "Model"
             )
         ):  # Assumption: when completing missing component, using component name as task name
-            resp_dict[
-                "description"
-            ] += f"\n\nYou have tried to implement the same component and got the following exception: \n{exp_and_feedback[1].exception}\n Please try different methods to avoid the same errors and results in an infinite loop"
+            former_task_desc += f"\n\nYou have tried to implement the same component and got the following exception: \n{exp_and_feedback[1].exception}\n Please try different methods to avoid the same errors and results in an infinite loop"
+
+        resp_dict = self._init_task_gen(
+            targets=component,
+            scenario_desc=scenario_desc,
+            spec=last_successful_exp.experiment_workspace.file_dict[spec_file] if spec_file else None,
+            task_output_format=T(f".prompts:output_format.{component_prompt_key or component.lower()}").r(),
+            former_task=former_task_desc,
+        )
 
         task = task_cls(
             name=component if component != "Model" else resp_dict.pop("model_name"),
             description=resp_dict.get("description", f"{component} description not provided"),
-            **resp_dict.get("extra_params", {}),
+            **{
+                k: resp_dict.get("extra_params", {}).get(k, v)
+                for k, v in COMPONENT_TASK_MAPPING[component].get("extra_params", {}).items()
+            },
         )
 
         exp = DSExperiment(pending_tasks_list=[[task]], hypothesis=DSHypothesis(component))
@@ -283,10 +283,10 @@ class DSExpGen(ExpGen):
                 exp=sota_exp, heading="Best of previous exploration of the scenario"
             )
             last_exp_diff = "\n".join(
-                generate_diff(
-                    sota_exp.experiment_workspace.workspace_path, last_exp.experiment_workspace.workspace_path
+                generate_diff_from_dict(
+                    sota_exp.experiment_workspace.file_dict, last_exp.experiment_workspace.file_dict
                 )
-            )
+            )  # we use file_dict for hitting the cache when replicate the experiment in another machine.
             exp_and_feedback_desc = T("scenarios.data_science.share:describe.feedback").r(
                 exp_and_feedback=exp_and_feedback
             )
@@ -322,6 +322,7 @@ class DSExpGen(ExpGen):
                     targets=component_info["target_name"],
                     component=component,
                     scenario=scenario_desc,
+                    hypothesis_specification=T(".prompts:hypothesis_specification").r(),
                     hypothesis_output_format=T(".prompts:output_format.hypothesis").r(),
                     task_specification=sota_exp.experiment_workspace.file_dict[component_info["spec_file"]],
                     task_output_format=component_info["task_output_format"],
@@ -346,40 +347,51 @@ class DSExpGen(ExpGen):
                     recent_trace_desc="\n".join(recent_trace_desc),
                 )
 
-                resp_dict = json.loads(
-                    APIBackend().build_messages_and_create_chat_completion(
-                        user_prompt=user_prompt, system_prompt=system_prompt, json_mode=True
-                    )
-                )
-                assert "hypothesis_proposal" in resp_dict, "Hypothesis proposal not provided."
-                assert "task_design" in resp_dict, "Task design not provided."
-                task_class = component_info["task_class"]
-                hypothesis_proposal = resp_dict.get("hypothesis_proposal", {})
-                hypothesis = DSHypothesis(
-                    component=component,
-                    hypothesis=hypothesis_proposal.get("hypothesis", ""),
-                    reason=hypothesis_proposal.get("reason", ""),
-                    concise_reason=hypothesis_proposal.get("concise_reason", ""),
-                    concise_observation=hypothesis_proposal.get("concise_observation", ""),
-                    concise_justification=hypothesis_proposal.get("concise_justification", ""),
-                    concise_knowledge=hypothesis_proposal.get("concise_knowledge", ""),
-                )
+                def _append_retry(args: tuple, kwargs: dict) -> tuple[tuple, dict]:
+                    # Only modify the user_prompt on retries (i > 0)
+                    user_prompt = args[0]
+                    user_prompt += "\n\nretrying..."
+                    return (user_prompt,), kwargs
 
-                task_design = resp_dict.get("task_design", {})
-                task_name = task_design["model_name"] if component == "Model" else component
-                description = task_design.get(
-                    "description", f"{component_info['target_name']} description not provided"
-                )
-                task = task_class(
-                    name=task_name,
-                    description=description,
-                    **{k: task_design.get(k, v) for k, v in component_info.get("extra_params", {}).items()},
-                )
+                @wait_retry(retry_n=5, transform_args_fn=_append_retry)
+                def _f(user_prompt):
+                    resp_dict = json.loads(
+                        APIBackend().build_messages_and_create_chat_completion(
+                            user_prompt=user_prompt, system_prompt=system_prompt, json_mode=True
+                        )
+                    )
+                    assert "hypothesis_proposal" in resp_dict, "Hypothesis proposal not provided."
+                    assert "task_design" in resp_dict, "Task design not provided."
+                    task_class = component_info["task_class"]
+                    hypothesis_proposal = resp_dict.get("hypothesis_proposal", {})
+                    hypothesis = DSHypothesis(
+                        component=component,
+                        hypothesis=hypothesis_proposal.get("hypothesis", ""),
+                        reason=hypothesis_proposal.get("reason", ""),
+                        concise_reason=hypothesis_proposal.get("concise_reason", ""),
+                        concise_observation=hypothesis_proposal.get("concise_observation", ""),
+                        concise_justification=hypothesis_proposal.get("concise_justification", ""),
+                        concise_knowledge=hypothesis_proposal.get("concise_knowledge", ""),
+                    )
+
+                    task_design = resp_dict.get("task_design", {})
+                    task_name = task_design["model_name"] if component == "Model" else component
+                    description = task_design.get(
+                        "description", f"{component_info['target_name']} description not provided"
+                    )
+                    task = task_class(
+                        name=task_name,
+                        description=description,
+                        **{k: task_design.get(k, v) for k, v in component_info.get("extra_params", {}).items()},
+                    )
+                    new_workflow_desc = resp_dict.get("workflow_update", "No update needed")
+                    return hypothesis, task, new_workflow_desc
+
+                hypothesis, task, new_workflow_desc = _f(user_prompt)
 
                 exp = DSExperiment(pending_tasks_list=[[task]], hypothesis=hypothesis)
                 exp.experiment_workspace.inject_code_from_folder(sota_exp.experiment_workspace.workspace_path)
 
-                new_workflow_desc = resp_dict.get("workflow_update", "No update needed")
                 if new_workflow_desc != "No update needed":
                     workflow_task = WorkflowTask(
                         name="Workflow",

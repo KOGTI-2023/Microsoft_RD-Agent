@@ -61,13 +61,13 @@ class WorkflowGeneralCaseSpecEvaluator(CoSTEEREvaluator):
         }
         de = DockerEnv(conf=ds_docker_conf)
 
-        # DockerEnv for MLEBench submission validation
-        mle_de_conf = MLEBDockerConf()
-        mle_de_conf.extra_volumes = {
-            f"{DS_RD_SETTING.local_data_path}/zip_files": "/mle/data",
-        }
-        mde = DockerEnv(conf=mle_de_conf)
-        mde.prepare()
+        # # DockerEnv for MLEBench submission validation
+        # mle_de_conf = MLEBDockerConf()
+        # mle_de_conf.extra_volumes = {
+        #     f"{DS_RD_SETTING.local_data_path}/zip_files": "/mle/data",
+        # }
+        # mde = DockerEnv(conf=mle_de_conf)
+        # mde.prepare()
 
         # Clean the scores.csv & submission.csv.
         stdout = implementation.execute(env=de, entry=f"rm submission.csv scores.csv")
@@ -80,36 +80,38 @@ class WorkflowGeneralCaseSpecEvaluator(CoSTEEREvaluator):
         if not score_fp.exists():
             stdout += "\nMetrics file (scores.csv) is not generated."
         else:
-            score_df = pd.read_csv(score_fp, index_col=0)
-            model_set_in_scores = set(score_df.index)
-            model_set_in_folder = set(
-                f[:-3] for f in implementation.file_dict.keys() if re.match(r"^model_(?!test)\w+\.py$", f)
-            )
-            for model in model_set_in_folder:
-                if model not in model_set_in_scores:
-                    stdout += (
-                        f"\nModel {model} is not evaluated in the scores.csv. The scores.csv has {model_set_in_scores}."
-                    )
+            try:
+                score_df = pd.read_csv(score_fp, index_col=0)
+                model_set_in_scores = set(score_df.index)
+                model_set_in_folder = set(
+                    f[:-3] for f in implementation.file_dict.keys() if re.match(r"^model_(?!test)\w+\.py$", f)
+                )
+                for model in model_set_in_folder:
+                    if model not in model_set_in_scores:
+                        stdout += f"\nModel {model} is not evaluated in the scores.csv. The scores.csv has {model_set_in_scores}."
+            except Exception as e:
+                stdout += f"\nError in checking the scores.csv file: {e}\nscores.csv's content:\n-----\n{score_fp.read_text()}\n-----"
 
         # Check submission file
         submission_fp = implementation.workspace_path / "submission.csv"
         if not submission_fp.exists():
             stdout += "\nSubmission file (submission.csv) is not generated."
         else:
-            base_check_code = (DIRNAME / "eval_tests" / "submission_check.txt").read_text()
-            implementation.inject_files(**{"submission_check.py": base_check_code})
-            stdout += "----Submission Check 1-----\n"
-            stdout += implementation.execute(env=de, entry="python submission_check.py")
+            base_check_code = (DIRNAME / "eval_tests" / "submission_format_test.txt").read_text()
+            implementation.inject_files(**{"test/submission_format_test.py": base_check_code})
+            # stdout += "----Submission Check 1-----\n"
+            stdout += implementation.execute(env=de, entry="python test/submission_format_test.py")
 
             # MLEBench Check
-            mle_check_code = (
-                (DIRNAME / "eval_tests" / "mle_submission_check.txt")
-                .read_text()
-                .replace("<competition_id>", self.scen.competition)
-            )
-            implementation.inject_files(**{"mle_submission_check.py": mle_check_code})
-            stdout += "----Submission Check 2-----\n"
-            stdout += implementation.execute(env=mde, entry=f"python mle_submission_check.py")
+            # !!! Since we are running on a sampled dataset, mlebench check is not required.
+            # mle_check_code = (
+            #     (DIRNAME / "eval_tests" / "mle_submission_format_test.txt")
+            #     .read_text()
+            #     .replace("<competition_id>", self.scen.competition)
+            # )
+            # implementation.inject_files(**{"test/mle_submission_format_test.py": mle_check_code})
+            # stdout += "----Submission Check 2-----\n"
+            # stdout += implementation.execute(env=mde, entry=f"python test/mle_submission_format_test.py")
 
         system_prompt = T(".prompts:workflow_eval.system").r(
             scenario=self.scen.get_scenario_all_desc(),

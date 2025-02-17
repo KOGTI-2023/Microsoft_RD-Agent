@@ -13,10 +13,12 @@ from pathlib import Path
 from typing import Any, Generic, TypeVar
 
 from rdagent.core.conf import RD_AGENT_SETTINGS
+from rdagent.core.evaluation import Feedback
 from rdagent.utils import filter_progress_bar
+from rdagent.utils.fmt import shrink_text
 
 if typing.TYPE_CHECKING:
-    from rdagent.core.proposal import Hypothesis
+    from rdagent.core.proposal import ExperimentFeedback, Hypothesis
     from rdagent.utils.env import Env
 
 """
@@ -54,9 +56,10 @@ class Task(AbsTask):
 
 
 ASpecificTask = TypeVar("ASpecificTask", bound=Task)
+ASpecificFeedback = TypeVar("ASpecificFeedback", bound=Feedback)
 
 
-class Workspace(ABC, Generic[ASpecificTask]):
+class Workspace(ABC, Generic[ASpecificTask, ASpecificFeedback]):
     """
     A workspace is a place to store the task implementation. It evolves as the developer implements the task.
     To get a snapshot of the workspace, make sure call `copy` to get a copy of the workspace.
@@ -64,6 +67,7 @@ class Workspace(ABC, Generic[ASpecificTask]):
 
     def __init__(self, target_task: ASpecificTask | None = None) -> None:
         self.target_task: ASpecificTask | None = target_task
+        self.feedback: ASpecificFeedback | None = None
 
     @abstractmethod
     def execute(self, *args: Any, **kwargs: Any) -> object | None:
@@ -129,8 +133,8 @@ class FBWorkspace(Workspace):
         Helper function to format the code dictionary into a string.
         """
         code_string = ""
-        for file_name, code in code_dict.items():
-            code_string += f"\nFile Path: {file_name}\n```\n{code}\n```"
+        for file_name in sorted(code_dict.keys()):
+            code_string += f"\nFile Path: {file_name}\n```\n{code_dict[file_name]}\n```"
         return code_string
 
     @property
@@ -236,7 +240,12 @@ class FBWorkspace(Workspace):
         self.inject_files(**self.file_dict)
         # TODO: env should be not None in new design (no code can run without environment)
         if env is not None and entry is not None:
-            return filter_progress_bar(env.run(entry, str(self.workspace_path)))
+            # We believe that removing the progress bar might resolve the issue.
+            # If needed, cutting off the information in the middle should be a backup plan.
+            return shrink_text(
+                filter_progress_bar(env.run(entry, str(self.workspace_path))),
+                context_lines=RD_AGENT_SETTINGS.stdout_context_len,
+            )
         return None
 
     def __str__(self) -> str:
@@ -271,6 +280,16 @@ class Experiment(
         # If we implement the whole workflow, we don't have to use it, then we remove it.
         self.based_experiments: Sequence[ASpecificWSForExperiment] = based_experiments
 
+        self.experiment_workspace: ASpecificWSForExperiment | None = None
+
+        # The experiment may be developed by different developers.
+        # Last feedback is used to propagate info to the next developer.
+        # Life cycle:
+        # - Developer assigns feedback for next component;
+        # - Workflow control clears feedback.
+        self.prop_dev_feedback: Feedback | None = None
+
+        # TODO: (xiao) I think this is too concrete; we should move it into
         # NOTE: Assumption
         # - only runner will assign this variable
         # - We will always create a new Experiment without copying previous results when we goto the next new loop.
@@ -278,7 +297,6 @@ class Experiment(
         self.sub_results: dict[str, float] = (
             {}
         )  # TODO: in Kaggle, now sub results are all saved in self.result, remove this in the future.
-        self.experiment_workspace: ASpecificWSForExperiment | None = None
 
 
 ASpecificExp = TypeVar("ASpecificExp", bound=Experiment)

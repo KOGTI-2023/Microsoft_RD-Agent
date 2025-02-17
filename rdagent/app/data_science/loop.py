@@ -5,19 +5,24 @@ import fire
 
 from rdagent.app.data_science.conf import DS_RD_SETTING
 from rdagent.components.coder.data_science.ensemble import EnsembleCoSTEER
+from rdagent.components.coder.data_science.ensemble.exp import EnsembleTask
 from rdagent.components.coder.data_science.feature import FeatureCoSTEER
+from rdagent.components.coder.data_science.feature.exp import FeatureTask
 from rdagent.components.coder.data_science.model import ModelCoSTEER
+from rdagent.components.coder.data_science.model.exp import ModelTask
 from rdagent.components.coder.data_science.raw_data_loader import DataLoaderCoSTEER
+from rdagent.components.coder.data_science.raw_data_loader.exp import DataLoaderTask
 from rdagent.components.coder.data_science.workflow import WorkflowCoSTEER
+from rdagent.components.coder.data_science.workflow.exp import WorkflowTask
 from rdagent.components.workflow.conf import BasePropSetting
 from rdagent.components.workflow.rd_loop import RDLoop
 from rdagent.core.exception import CoderError, RunnerError
-from rdagent.core.proposal import ExperimentFeedback, HypothesisFeedback
+from rdagent.core.proposal import ExperimentFeedback
 from rdagent.core.scenario import Scenario
 from rdagent.core.utils import import_class
 from rdagent.log import rdagent_logger as logger
 from rdagent.scenarios.data_science.dev.feedback import DSExperiment2Feedback
-from rdagent.scenarios.data_science.dev.runner import DSRunner
+from rdagent.scenarios.data_science.dev.runner import DSCoSTEERRunner
 from rdagent.scenarios.data_science.experiment.experiment import DSExperiment
 from rdagent.scenarios.data_science.proposal.exp_gen import DSExpGen, DSTrace
 from rdagent.scenarios.kaggle.kaggle_crawler import download_data
@@ -49,7 +54,7 @@ class DataScienceRDLoop(RDLoop):
         self.ensemble_coder = EnsembleCoSTEER(scen)
         self.workflow_coder = WorkflowCoSTEER(scen)
 
-        self.runner = DSRunner(scen)
+        self.runner = DSCoSTEERRunner(scen)
         # self.summarizer: Experiment2Feedback = import_class(PROP_SETTING.summarizer)(scen)
         # logger.log_object(self.summarizer, tag="summarizer")
 
@@ -70,15 +75,15 @@ class DataScienceRDLoop(RDLoop):
         exp = prev_out["direct_exp_gen"]
         for tasks in exp.pending_tasks_list:
             exp.sub_tasks = tasks
-            if exp.hypothesis.component == "DataLoadSpec":
+            if isinstance(exp.sub_tasks[0], DataLoaderTask):
                 exp = self.data_loader_coder.develop(exp)
-            elif exp.hypothesis.component == "FeatureEng":
+            elif isinstance(exp.sub_tasks[0], FeatureTask):
                 exp = self.feature_coder.develop(exp)
-            elif exp.hypothesis.component == "Model":
+            elif isinstance(exp.sub_tasks[0], ModelTask):
                 exp = self.model_coder.develop(exp)
-            elif exp.hypothesis.component == "Ensemble":
+            elif isinstance(exp.sub_tasks[0], EnsembleTask):
                 exp = self.ensemble_coder.develop(exp)
-            elif exp.hypothesis.component == "Workflow":
+            elif isinstance(exp.sub_tasks[0], WorkflowTask):
                 exp = self.workflow_coder.develop(exp)
             else:
                 raise NotImplementedError(f"Unsupported component in DataScienceRDLoop: {exp.hypothesis.component}")
@@ -118,7 +123,7 @@ class DataScienceRDLoop(RDLoop):
                     ExperimentFeedback.from_exception(e),
                 )
             )
-            if len(self.trace.hist) >= DS_RD_SETTING.consecutive_errors:
+            if self.trace.sota_experiment() is None and len(self.trace.hist) >= DS_RD_SETTING.consecutive_errors:
                 trace_exp_next_component_list = [
                     exp.next_component_required() for exp, _ in self.trace.hist[-DS_RD_SETTING.consecutive_errors :]
                 ]

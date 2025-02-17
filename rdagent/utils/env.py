@@ -11,6 +11,7 @@ import json
 import os
 import pickle
 import re
+import shutil
 import subprocess
 import time
 import uuid
@@ -34,6 +35,7 @@ from rdagent.core.conf import ExtendedBaseSettings, ExtendedSettingsConfigDict
 from rdagent.core.experiment import RD_AGENT_SETTINGS
 from rdagent.log import rdagent_logger as logger
 from rdagent.oai.llm_utils import md5_hash
+from rdagent.utils.workflow import wait_retry
 
 ASpecificBaseModel = TypeVar("ASpecificBaseModel", bound=BaseModel)
 
@@ -147,6 +149,9 @@ class DockerConf(ExtendedBaseSettings):
     running_timeout_period: int = 3600  # 1 hour
 
     enable_cache: bool = True  # enable the cache mechanism
+
+    retry_count: int = 5  # retry count for the docker run
+    retry_wait_seconds: int = 10  # retry wait seconds for the docker run
 
 
 class QlibDockerConf(DockerConf):
@@ -313,12 +318,17 @@ class DockerEnv(Env[DockerConf]):
                 [docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])] if self.conf.enable_gpu else None
             ),
         }
-        try:
-            client.containers.run(self.conf.image, "nvidia-smi", **gpu_kwargs)
-            logger.info("GPU Devices are available.")
-        except docker.errors.APIError:
-            return {}
-        return gpu_kwargs
+
+        @wait_retry(5, 10)
+        def _f() -> dict:
+            try:
+                client.containers.run(self.conf.image, "nvidia-smi", **gpu_kwargs)
+                logger.info("GPU Devices are available.")
+            except docker.errors.APIError:
+                return {}
+            return gpu_kwargs
+
+        return _f()
 
     def replace_time_info(self, input_string: str) -> str:
         """To remove any time related information from the logs since it will destroy the cache mechanism"""
@@ -397,6 +407,24 @@ class DockerEnv(Env[DockerConf]):
         except docker.errors.APIError as e:
             raise RuntimeError(f"Error while running the container: {e}")
 
+    def __run_with_retry(
+        self,
+        entry: str | None = None,
+        local_path: str = ".",
+        env: dict | None = None,
+        running_extra_volume: dict | None = None,
+        remove_timestamp: bool = True,
+    ) -> str:
+        for retry_index in range(self.conf.retry_count):
+            try:
+                return self.__run(entry, local_path, env, running_extra_volume, remove_timestamp)
+            except Exception as e:
+                logger.warning(
+                    f"Error while running the container: {e}, current try index: {retry_index + 1}, {self.conf.retry_count - retry_index - 1} retries left."
+                )
+                time.sleep(self.conf.retry_wait_seconds)
+        raise RuntimeError("Error while running the container. Retry count exceeded.")
+
     def zip_a_folder_into_a_file(self, folder_path: str, zip_file_path: str) -> None:
         """
         Zip a folder into a file, use zipfile instead of subprocess
@@ -410,6 +438,11 @@ class DockerEnv(Env[DockerConf]):
         """
         Unzip a file into a folder, use zipfile instead of subprocess
         """
+        # Clear folder_path before extracting
+        if os.path.exists(folder_path):
+            shutil.rmtree(folder_path)
+        os.makedirs(folder_path)
+
         with zipfile.ZipFile(zip_file_path, "r") as z:
             z.extractall(folder_path)
 
@@ -428,6 +461,18 @@ class DockerEnv(Env[DockerConf]):
         """
         target_folder = Path(RD_AGENT_SETTINGS.pickle_cache_folder_path_str) / f"utils.env.run"
         target_folder.mkdir(parents=True, exist_ok=True)
+
+        # we must add the information of data (beyound code) into the key.
+        # Otherwise, all commands operating on data will become invalue (e.g. rm -r submission.csv)
+        # So we recursively walk in the folder and add the sorted relative filename list as part of the key.
+        data_key = []
+        for path in Path(local_path).rglob("*"):
+            p = str(path.relative_to(Path(local_path)))
+            if p.startswith("__pycache__"):
+                continue
+            data_key.append(p)
+        data_key = sorted(data_key)
+
         key = md5_hash(
             json.dumps(
                 [
@@ -437,13 +482,14 @@ class DockerEnv(Env[DockerConf]):
             )
             + json.dumps({"entry": entry, "running_extra_volume": running_extra_volume})
             + json.dumps({"extra_volumes": self.conf.extra_volumes})
+            + json.dumps(data_key)
         )
         if Path(target_folder / f"{key}.pkl").exists() and Path(target_folder / f"{key}.zip").exists():
             with open(target_folder / f"{key}.pkl", "rb") as f:
                 ret: str = pickle.load(f)
             self.unzip_a_file_into_a_folder(str(target_folder / f"{key}.zip"), local_path)
         else:
-            ret = self.__run(entry, local_path, env, running_extra_volume, remove_timestamp)
+            ret = self.__run_with_retry(entry, local_path, env, running_extra_volume, remove_timestamp)
             with open(target_folder / f"{key}.pkl", "wb") as f:
                 pickle.dump(ret, f)
             self.zip_a_folder_into_a_file(local_path, str(target_folder / f"{key}.zip"))
@@ -466,7 +512,9 @@ class DockerEnv(Env[DockerConf]):
         if self.conf.enable_cache:
             out = self.cached_run(entry_add_timeout, local_path, env, running_extra_volume)
         else:
-            out = self.__run(entry_add_timeout, local_path, env, running_extra_volume, remove_timestamp=False)
+            out = self.__run_with_retry(
+                entry_add_timeout, local_path, env, running_extra_volume, remove_timestamp=False
+            )
         end = time.time()
 
         if end - start + 1 >= self.conf.running_timeout_period:

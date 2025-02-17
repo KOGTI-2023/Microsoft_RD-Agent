@@ -1,9 +1,10 @@
 import os
 import platform
 import shutil
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
@@ -36,7 +37,7 @@ class GenericDataHandler(DataHandler):
         suffix = path.suffix.lower()
 
         if suffix == ".csv":
-            return pd.read_csv(path)
+            return pd.read_csv(path, encoding="utf-8")
         elif suffix == ".pkl":
             return pd.read_pickle(path)
         elif suffix == ".parquet":
@@ -61,7 +62,7 @@ class GenericDataHandler(DataHandler):
         suffix = path.suffix.lower()
 
         if suffix == ".csv":
-            df.to_csv(path, index=False)
+            df.to_csv(path, index=False, encoding="utf-8")
         elif suffix == ".pkl":
             df.to_pickle(path)
         elif suffix == ".parquet":
@@ -114,6 +115,8 @@ class UniqueIDDataReducer(DataReducer):
         self.random_reducer = RandDataReducer(min_frac, min_num)
 
     def reduce(self, df: pd.DataFrame) -> pd.DataFrame:
+        if not len(df):
+            return df
         if (
             not isinstance(df, pd.DataFrame)
             or not isinstance(df.iloc[0, -1], (int, float, str, tuple, frozenset, bytes, complex, type(None)))
@@ -150,6 +153,17 @@ def count_files_in_folder(folder: Path) -> int:
     Count the total number of files in a folder, including files in subfolders.
     """
     return sum(1 for _ in folder.rglob("*") if _.is_file())
+
+
+def copy_file(src_fp, target_folder, data_folder):
+    """
+    Construct the target file path based on the file's relative location from data_folder,
+    then copy the file if it doesn't already exist.
+    """
+    target_fp = target_folder / src_fp.relative_to(data_folder)
+    if not target_fp.exists():
+        target_fp.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(src_fp, target_fp)
 
 
 def create_debug_data(
@@ -237,31 +251,33 @@ def create_debug_data(
 
     # Process non-data files
     subfolder_dict = {}
+    global_groups = defaultdict(list)
     for file_path in files_to_process:
         if file_path in processed_files:
             continue  # Already handled above
         rel_dir = file_path.relative_to(data_folder).parts[0]
         subfolder_dict.setdefault(rel_dir, []).append(file_path)
+        global_groups[file_path.stem].append(Path(file_path))
 
     # For each subfolder, decide which files to copy
+    selected_groups = []
     for rel_dir, file_list in tqdm(subfolder_dict.items(), desc="Processing files", unit="file"):
         used_files = []
         not_used_files = []
+        extra_files = []
 
         # Check if each file is in the "used" list
         for fp in file_list:
             if str(fp.name) in sample_used_file_names or str(fp.stem) in sample_used_file_names:
                 used_files.append(fp)
             else:
+                if file_types_count.get(".txt", 1000) < 100 and fp.suffix.lower() == ".txt":
+                    extra_files.append(fp)
                 not_used_files.append(fp)
 
         # Directly copy used files
         for uf in used_files:
-            sampled_file_path = sample_folder / uf.relative_to(data_folder)
-            if sampled_file_path.exists():
-                continue
-            sampled_file_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy(uf, sampled_file_path)
+            copy_file(uf, sample_folder, data_folder)
 
         # If no files are used, randomly sample files to keep the folder from being empty
         if len(used_files) == 0:
@@ -269,14 +285,39 @@ def create_debug_data(
                 num_to_keep = len(file_list)
             else:
                 num_to_keep = max(int(len(file_list) * min_frac), min_num)
-            print(f"Sampling {num_to_keep} files without label from {len(file_list)} files in {rel_dir}")
-            sampled_not_used = pd.Series(not_used_files).sample(n=num_to_keep, random_state=1)
+
+            # Use a greedy strategy to select groups so that the total number of files is as close as possible to num_to_keep
+            total_files = 0
+            np.random.shuffle(not_used_files)
+            for nf in not_used_files:
+                if total_files > num_to_keep:
+                    break
+                if nf.stem in selected_groups:
+                    total_files += 1
+                else:
+                    selected_groups.append(nf.stem)
+                    total_files += 1
+
+            print(f"Sampling {num_to_keep} files without label from {total_files} files in {rel_dir}")
+
+            # Flatten the selected groups into a single list of files
+            sampled_not_used = [
+                nf for group, value in global_groups.items() if group in selected_groups for nf in value
+            ]
+
+            # Copy the selected files to the target directory (all files with the same base name will be copied)
             for nf in sampled_not_used:
+                # Construct the target path based on the relative path of nf from data_folder
                 sampled_file_path = sample_folder / nf.relative_to(data_folder)
                 if sampled_file_path.exists():
                     continue
                 sampled_file_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy(nf, sampled_file_path)
+
+        # Copy extra files
+        print(f"Copying {len(extra_files)} extra files")
+        for uf in extra_files:
+            copy_file(uf, sample_folder, data_folder)
 
     final_files_count = count_files_in_folder(sample_folder)
     print(f"[INFO] After sampling, the sample folder `{sample_folder}` contains {final_files_count} files in total.")

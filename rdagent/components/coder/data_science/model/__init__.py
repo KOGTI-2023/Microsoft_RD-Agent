@@ -5,7 +5,10 @@ from jinja2 import Environment, StrictUndefined
 
 from rdagent.components.coder.CoSTEER import CoSTEER
 from rdagent.components.coder.CoSTEER.config import CoSTEER_SETTINGS
-from rdagent.components.coder.CoSTEER.evaluators import CoSTEERMultiEvaluator
+from rdagent.components.coder.CoSTEER.evaluators import (
+    CoSTEERMultiEvaluator,
+    CoSTEERSingleFeedback,
+)
 from rdagent.components.coder.CoSTEER.evolving_strategy import (
     MultiProcessEvolvingStrategy,
 )
@@ -30,6 +33,7 @@ class ModelMultiProcessEvolvingStrategy(MultiProcessEvolvingStrategy):
         target_task: ModelTask,
         queried_knowledge: CoSTEERQueriedKnowledge | None = None,
         workspace: FBWorkspace | None = None,
+        prev_task_feedback: CoSTEERSingleFeedback | None = None,
     ) -> dict[str, str]:
         model_information_str = target_task.get_task_information()
 
@@ -44,23 +48,15 @@ class ModelMultiProcessEvolvingStrategy(MultiProcessEvolvingStrategy):
             if queried_knowledge is not None
             else []
         )
-        latest_code_feedback = [
-            knowledge.feedback
-            for knowledge in queried_former_failed_knowledge[0]
-            if knowledge.implementation.file_dict.get(f"{target_task.name}.py") is not None
-            and knowledge.implementation.file_dict.get(f"{target_task.name}.py")
-            == workspace.file_dict.get(f"{target_task.name}.py")
-        ]
-        if len(latest_code_feedback) > 0:
-            queried_former_failed_knowledge = (
-                [
-                    knowledge
-                    for knowledge in queried_former_failed_knowledge[0]
-                    if knowledge.implementation.file_dict.get(f"{target_task.name}.py")
-                    != workspace.file_dict.get(f"{target_task.name}.py")
-                ],
-                queried_former_failed_knowledge[1],
-            )
+        queried_former_failed_knowledge = (
+            [
+                knowledge
+                for knowledge in queried_former_failed_knowledge[0]
+                if knowledge.implementation.file_dict.get(f"{target_task.name}.py")
+                != workspace.file_dict.get(f"{target_task.name}.py")
+            ],
+            queried_former_failed_knowledge[1],
+        )
 
         # 2. code
         system_prompt = T(".prompts:model_coder.system").r(
@@ -79,10 +75,10 @@ class ModelMultiProcessEvolvingStrategy(MultiProcessEvolvingStrategy):
         # We want to use a simpler way to
         user_prompt = T(".prompts:model_coder.user_general").r(
             model_spec=workspace.file_dict["spec/model.md"],
-            workspace_code=workspace.get_codes(
+            latest_model_code=workspace.get_codes(
                 r"^model_(?!test)\w+\.py$"
             ),  # TODO: If we have high failure rate here, we should clean this step with less information.
-            latest_code_feedback=latest_code_feedback[0] if len(latest_code_feedback) > 0 else None,
+            latest_code_feedback=prev_task_feedback,
         )
 
         for _ in range(5):
@@ -100,12 +96,14 @@ class ModelMultiProcessEvolvingStrategy(MultiProcessEvolvingStrategy):
                 for key, value in batch_edit.items()
             }
 
+            user_prompt = user_prompt + "\nPlease avoid generating same code to former code!"
+            if batch_edit and max(len(i.encode("utf-8")) for i in batch_edit.keys()) > 255:
+                continue
+
             if batch_edit[f"{target_task.name}.py"] != "__DEL__" and batch_edit[
                 f"{target_task.name}.py"
             ] != workspace.file_dict.get(f"{target_task.name}.py"):
                 break
-            else:
-                user_prompt = user_prompt + "\nPlease avoid generating same code to former code!"
         else:
             raise CoderError("Failed to generate a new model code.")
 
