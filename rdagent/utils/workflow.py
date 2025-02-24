@@ -14,7 +14,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, TypeVar, cast
+from typing import Any, Callable, Optional, TypeVar, Union, cast
 
 from tqdm.auto import tqdm
 
@@ -91,13 +91,16 @@ class LoopBase:
         self.loop_trace = defaultdict(list[LoopTrace])  # the key is the number of loop
         self.session_folder = logger.log_trace_path / "__session__"
 
-    def run(self, step_n: int | None = None) -> None:
+    def run(self, step_n: int | None = None, loop_n: int | None = None) -> None:
         """
 
         Parameters
         ----------
         step_n : int | None
             How many steps to run;
+            `None` indicates to run forever until error or KeyboardInterrupt
+        loop_n: int | None
+            How many steps to run; if current loop is incomplete, it will be counted as the first loop for completion
             `None` indicates to run forever until error or KeyboardInterrupt
         """
         with tqdm(total=len(self.steps), desc="Workflow Progress", unit="step") as pbar:
@@ -106,6 +109,9 @@ class LoopBase:
                     if step_n <= 0:
                         break
                     step_n -= 1
+                if loop_n is not None:
+                    if loop_n <= 0:
+                        break
 
                 li, si = self.loop_idx, self.step_idx
                 name = self.steps[si]
@@ -141,6 +147,8 @@ class LoopBase:
                 self.step_idx = (self.step_idx + 1) % len(self.steps)
                 if self.step_idx == 0:  # reset to step 0 in next round
                     self.loop_idx += 1
+                    if loop_n is not None:
+                        loop_n -= 1
                     self.loop_prev_out = {}
                     pbar.reset()  # reset the progress bar for the next loop
 
@@ -153,10 +161,18 @@ class LoopBase:
             pickle.dump(self, f)
 
     @classmethod
-    def load(cls, path: str | Path) -> "LoopBase":
+    def load(cls, path: Union[str, Path], output_path: Optional[Union[str, Path]] = None) -> "LoopBase":
         path = Path(path)
         with path.open("rb") as f:
             session = cast(LoopBase, pickle.load(f))
+
+        # set session folder
+        if output_path:
+            output_path = Path(output_path)
+            output_path.mkdir(parents=True, exist_ok=True)
+            session.session_folder = output_path / "__session__"
+
+        # set trace path
         logger.set_trace_path(session.session_folder.parent)
 
         max_loop = max(session.loop_trace.keys())

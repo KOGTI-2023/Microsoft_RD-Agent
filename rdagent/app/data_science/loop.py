@@ -93,18 +93,24 @@ class DataScienceRDLoop(RDLoop):
 
     def running(self, prev_out: dict[str, Any]):
         exp: DSExperiment = prev_out["coding"]
-        if exp.next_component_required() is None:
+        if exp.is_ready_to_run():
             new_exp = self.runner.develop(exp)
             logger.log_object(new_exp)
             return new_exp
-        else:
-            return exp
+        return exp
 
     def feedback(self, prev_out: dict[str, Any]) -> ExperimentFeedback:
+        """
+        Assumption:
+        - If we come to feedback phase, the previous development steps are successful.
+        """
         exp: DSExperiment = prev_out["running"]
-        if exp.next_component_required() is None:
+        if self.trace.next_incomplete_component() is None:
+            # we have alreadly completed components in previous trace. So current loop is focusing on a new proposed idea.
+            # So we need feedback for the proposal.
             feedback = self.summarizer.generate_feedback(exp, self.trace)
         else:
+            # Otherwise, it is on drafting stage, don't need complicated feedbacks.
             feedback = ExperimentFeedback(
                 reason=f"{exp.hypothesis.component} is completed.",
                 decision=True,
@@ -124,10 +130,11 @@ class DataScienceRDLoop(RDLoop):
                 )
             )
             if self.trace.sota_experiment() is None and len(self.trace.hist) >= DS_RD_SETTING.consecutive_errors:
-                trace_exp_next_component_list = [
-                    exp.next_component_required() for exp, _ in self.trace.hist[-DS_RD_SETTING.consecutive_errors :]
-                ]
-                if None not in trace_exp_next_component_list and len(set(trace_exp_next_component_list)) == 1:
+                # if {in inital/drafting stage} and {tried enough times}
+                for _, fb in self.trace.hist[-DS_RD_SETTING.consecutive_errors :]:
+                    if fb:
+                        break  # any success will stop restarting.
+                else:  # otherwise restart it
                     logger.error("Consecutive errors reached the limit. Dumping trace.")
                     logger.log_object(self.trace, tag="trace before restart")
                     self.trace = DSTrace(scen=self.trace.scen, knowledge_base=self.trace.knowledge_base)
@@ -135,15 +142,21 @@ class DataScienceRDLoop(RDLoop):
         logger.log_object(self.trace.sota_experiment(), tag="SOTA experiment")
 
 
-def main(path=None, step_n=None, competition="bms-molecular-translation"):
+def main(path=None, output_path=None, step_n=None, loop_n=None, competition="bms-molecular-translation"):
     """
 
     Parameters
     ----------
     path :
         path like `$LOG_PATH/__session__/1/0_propose`. It indicates that we restore the state that after finish the step 0 in loop1
+    output_path :
+        path like `$LOG_PATH`. It indicates that where we want to save our session and log information.
     step_n :
         How many steps to run; if None, it will run forever until error or KeyboardInterrupt
+    loop_n :
+        How many loops to run; if None, it will run forever until error or KeyboardInterrupt
+        - if current loop is incomplete, it will be counted as the first loop for completion.
+        - if both step_n and loop_n are provided, the process will stop as soon as either condition is met.
     competition :
 
 
@@ -168,8 +181,8 @@ def main(path=None, step_n=None, competition="bms-molecular-translation"):
     if path is None:
         kaggle_loop = DataScienceRDLoop(DS_RD_SETTING)
     else:
-        kaggle_loop = DataScienceRDLoop.load(path)
-    kaggle_loop.run(step_n=step_n)
+        kaggle_loop = DataScienceRDLoop.load(path, output_path)
+    kaggle_loop.run(step_n=step_n, loop_n=loop_n)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,7 @@
 import json
+from typing import Literal
+
+import pandas as pd
 
 from rdagent.components.coder.data_science.ensemble.exp import EnsembleTask
 from rdagent.components.coder.data_science.feature.exp import FeatureTask
@@ -90,27 +93,68 @@ class DSTrace(Trace[DataScienceScen, KnowledgeBase]):
         self.hist: list[tuple[DSExperiment, ExperimentFeedback]] = []
         self.knowledge_base = knowledge_base
 
-    def sota_experiment(self, last_n: int = -1) -> DSExperiment | None:
+    COMPLETE_ORDER = ("DataLoadSpec", "FeatureEng", "Model", "Ensemble", "Workflow")
+
+    def next_incomplete_component(self) -> COMPONENT | None:
         """
-        Access the last experiment result.
+        NOTE:
+        - A component will be complete until get True decision feedback !!!
+        """
+        for c in self.COMPLETE_ORDER:
+            if not self.has_component(c):
+                return c
+        return None
+
+    def has_component(self, component: COMPONENT) -> bool:
+        for exp, fb in self.hist:
+            assert isinstance(exp.hypothesis, DSHypothesis), "Hypothesis should be DSHypothesis (and not None)"
+            if exp.hypothesis.component == component and fb:
+                return True
+        return False
+
+    def experiment_and_feedback_list_after_init(
+        self, return_type: Literal["sota", "failed", "all"]
+    ) -> list[tuple[DSExperiment, ExperimentFeedback]]:
+        """
+        Retrieve a list of experiments and feedbacks based on the return_type.
 
         Parameters
         ----------
-        last_n : int
-            The index from the last experiment result to access.
-            Use -1 for the most recent experiment, -2 for the second most recent, and so on.
+        return_type : str
+            One of "sota", "failed", "all".
 
+        Returns
+        -------
+        list[tuple[DSExperiment, ExperimentFeedback]]
+            List of experiments and feedbacks.
+        """
+
+        final_component = self.COMPLETE_ORDER[-1]
+        has_final_component = False
+        exp_and_feedback_list = []
+        for exp, fb in self.hist:
+            if has_final_component:
+                if return_type == "all":
+                    exp_and_feedback_list.append((exp, fb))
+                elif return_type == "failed" and not fb.decision:
+                    exp_and_feedback_list.append((exp, fb))
+                elif return_type == "sota" and fb.decision:
+                    exp_and_feedback_list.append((exp, fb))
+            if exp.hypothesis.component == final_component and fb:
+                has_final_component = True
+        return exp_and_feedback_list
+
+    def sota_experiment(self) -> DSExperiment | None:
+        """
         Returns
         -------
         Experiment or None
             The experiment result if found, otherwise None.
         """
-        assert last_n < 0
-        for exp, ef in self.hist[::-1]:
-            # the sota exp should be accepted decision and all required components are completed.
-            if ef.decision and exp.next_component_required() is None:
-                last_n += 1
-                if last_n == 0:
+        if self.next_incomplete_component() is None:
+            for exp, ef in self.hist[::-1]:
+                # the sota exp should be accepted decision and all required components are completed.
+                if ef.decision:
                     return exp
         return None
 
@@ -193,30 +237,23 @@ class DSExpGen(ExpGen):
             last_successful_exp: Last successful experiment or None
             spec_file: Path to specification file if needed
         """
-        former_task_desc = (
-            trace.hist[-1][0].pending_tasks_list[0][0].get_task_information()
-            if len(trace.hist) > 0 and trace.hist[-1][0] is not last_successful_exp
-            else None
-        )
 
-        exp_and_feedback = trace.hist[-1] if len(trace.hist) > 0 else None
-        if (
-            exp_and_feedback
-            and exp_and_feedback[1].exception is not None
-            and (
-                exp_and_feedback[0].pending_tasks_list[0][0].name == component
-                or exp_and_feedback[0].pending_tasks_list[0][0].name.startswith("model_")
-                and component == "Model"
-            )
-        ):  # Assumption: when completing missing component, using component name as task name
-            former_task_desc += f"\n\nYou have tried to implement the same component and got the following exception: \n{exp_and_feedback[1].exception}\n Please try different methods to avoid the same errors and results in an infinite loop"
+        former_tasks_desc = ""
+        if len(trace.hist) > 0:
+            for exp, fb in reversed(trace.hist):
+                if exp is not last_successful_exp:
+                    former_task_desc = exp.pending_tasks_list[0][0].get_task_information()
+                    former_task_desc += f"\n\nYou have tried to implement the same component and got the following exception: \n{fb.exception}\n Please try different methods to avoid the same errors and results in an infinite loop"
+                    former_tasks_desc += former_task_desc
+                else:
+                    break
 
         resp_dict = self._init_task_gen(
             targets=component,
             scenario_desc=scenario_desc,
             spec=last_successful_exp.experiment_workspace.file_dict[spec_file] if spec_file else None,
             task_output_format=T(f".prompts:output_format.{component_prompt_key or component.lower()}").r(),
-            former_task=former_task_desc,
+            former_task=former_tasks_desc if former_tasks_desc else None,
         )
 
         task = task_cls(
@@ -237,10 +274,7 @@ class DSExpGen(ExpGen):
         scenario_desc = trace.scen.get_scenario_all_desc()
         last_successful_exp = trace.last_successful_exp()
 
-        if len(trace.hist) == 0 or last_successful_exp is None:
-            next_missing_component = "DataLoadSpec"
-        else:
-            next_missing_component = last_successful_exp.next_component_required()
+        next_missing_component = trace.next_incomplete_component()
 
         init_component_config = {
             "DataLoadSpec": {"task_cls": DataLoaderTask, "spec_file": None, "component_prompt_key": "data_loader"},
@@ -287,8 +321,27 @@ class DSExpGen(ExpGen):
                     sota_exp.experiment_workspace.file_dict, last_exp.experiment_workspace.file_dict
                 )
             )  # we use file_dict for hitting the cache when replicate the experiment in another machine.
-            exp_and_feedback_desc = T("scenarios.data_science.share:describe.feedback").r(
-                exp_and_feedback=exp_and_feedback
+
+            sota_exp_feedback_list = trace.experiment_and_feedback_list_after_init(return_type="sota")
+            failed_exp_feedback_list = trace.experiment_and_feedback_list_after_init(return_type="failed")[
+                -self.max_trace_hist :
+            ]
+            all_exp_feedback_list = trace.experiment_and_feedback_list_after_init(return_type="all")
+            trace_component_to_feedback_df = pd.DataFrame(columns=["component", "hypothesis", "decision"])
+            for index, (exp, fb) in enumerate(all_exp_feedback_list):
+                trace_component_to_feedback_df.loc[f"trial {index + 1}"] = [
+                    exp.hypothesis.component,
+                    exp.hypothesis.hypothesis,
+                    fb.decision,
+                ]
+
+            sota_exp_feedback_list_desc = T("scenarios.data_science.share:describe.trace").r(
+                exp_and_feedback_list=sota_exp_feedback_list,
+                success=True,
+            )
+            failed_exp_feedback_list_desc = T("scenarios.data_science.share:describe.trace").r(
+                exp_and_feedback_list=failed_exp_feedback_list,
+                success=False,
             )
 
             # Generate component using template with proper context
@@ -300,7 +353,13 @@ class DSExpGen(ExpGen):
             )
 
             component_user_prompt = T(".prompts:component_gen.user").r(
-                exp_and_feedback_desc=exp_and_feedback_desc,
+                sota_exp_and_feedback_list_desc=sota_exp_feedback_list_desc,
+                failed_exp_and_feedback_list_desc=failed_exp_feedback_list_desc,
+                component_and_feedback_df=(
+                    trace_component_to_feedback_df.to_string()
+                    if len(trace_component_to_feedback_df) > 0
+                    else "No experiment and feedback provided"
+                ),
             )
 
             resp_dict_component: dict = json.loads(
@@ -310,6 +369,16 @@ class DSExpGen(ExpGen):
             )
 
             component = resp_dict_component.get("component", "Component not provided")
+            component_reason = resp_dict_component.get("reason", "Reason not provided")
+            sota_exp_model_file_count = len(
+                [
+                    k
+                    for k in sota_exp.experiment_workspace.file_dict.keys()
+                    if k.endswith(".py") and "test" not in k and k.startswith("model")
+                ]
+            )
+            if sota_exp_model_file_count <= 1 and component == "Ensemble":
+                component = "Model"
 
             # Why we should split component selection and steps after?
             # - after we know the selected component, we can use RAG.
@@ -330,21 +399,11 @@ class DSExpGen(ExpGen):
                     workflow_check=(not component == "Workflow"),
                 )
 
-                recent_trace_desc = []
-                for i in range(self.max_trace_hist):
-                    if i < len(trace.hist):
-                        eaf = trace.hist[-i - 1]
-                        if eaf[1].decision:
-                            # we only add failed direction incase of trying same invalid direction
-                            break
-                        recent_trace_desc.insert(
-                            0, T("scenarios.data_science.share:describe.feedback").r(exp_and_feedback=eaf)
-                        )
                 user_prompt = T(".prompts:direct_exp_gen.user").r(
-                    exp_and_feedback_desc=exp_and_feedback_desc,
-                    sota_exp_desc=sota_exp_desc,
+                    targets=component_info["target_name"],
+                    sota_exp_and_feedback_list_desc=sota_exp_feedback_list_desc,
+                    failed_exp_and_feedback_list_desc=failed_exp_feedback_list_desc,
                     last_exp_diff=last_exp_diff,
-                    recent_trace_desc="\n".join(recent_trace_desc),
                 )
 
                 def _append_retry(args: tuple, kwargs: dict) -> tuple[tuple, dict]:
@@ -367,7 +426,7 @@ class DSExpGen(ExpGen):
                     hypothesis = DSHypothesis(
                         component=component,
                         hypothesis=hypothesis_proposal.get("hypothesis", ""),
-                        reason=hypothesis_proposal.get("reason", ""),
+                        reason=component_reason + "\n" + hypothesis_proposal.get("reason", ""),
                         concise_reason=hypothesis_proposal.get("concise_reason", ""),
                         concise_observation=hypothesis_proposal.get("concise_observation", ""),
                         concise_justification=hypothesis_proposal.get("concise_justification", ""),
