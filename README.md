@@ -22,9 +22,16 @@
 [![Documentation Status](https://readthedocs.org/projects/rdagent/badge/?version=latest)](https://rdagent.readthedocs.io/en/latest/?badge=latest)
 [![Readthedocs Preview](https://github.com/microsoft/RD-Agent/actions/workflows/readthedocs-preview.yml/badge.svg)](https://github.com/microsoft/RD-Agent/actions/workflows/readthedocs-preview.yml) <!-- this badge is too long, please place it in the last one to make it pretty --> 
 
+# Data Science Agent Preview
+Check out our demo video showcasing the current progress of our Data Science Agent under development:
+
+https://github.com/user-attachments/assets/3eccbecb-34a4-4c81-bce4-d3f8862f7305
+
 # 📰 News
 | 🗞️ News        | 📝 Description                 |
-| --            | ------      
+| --            | ------      |
+| Support LiteLLM Backend | We now fully support **[LiteLLM](https://github.com/BerriAI/litellm)** as a backend for integration with multiple LLM providers. |
+| More General Data Science Agent | 🚀Coming soon! |
 | Kaggle Scenario release | We release **[Kaggle Agent](https://rdagent.readthedocs.io/en/latest/scens/kaggle_agent.html)**, try the new features!                  |
 | Official WeChat group release  | We created a WeChat group, welcome to join! (🗪[QR Code](docs/WeChat_QR_code.jpg)) |
 | Official Discord release  | We launch our first chatting channel in Discord (🗪[![Chat](https://img.shields.io/badge/chat-discord-blue)](https://discord.gg/ybQ97B6Jjy)) |
@@ -66,6 +73,7 @@ You can try above demos by running the following command:
 
 ### 🐳 Docker installation.
 Users must ensure Docker is installed before attempting most scenarios. Please refer to the [official 🐳Docker page](https://docs.docker.com/engine/install/) for installation instructions.
+Ensure the current user can run Docker commands **without using sudo**. You can verify this by executing `docker run hello-world`.
 
 ### 🐍 Create a Conda Environment
 - Create a new conda environment with Python (3.10 and 3.11 are well-tested in our CI):
@@ -106,7 +114,7 @@ Users must ensure Docker is installed before attempting most scenarios. Please r
   CHAT_MODEL=gpt-4-turbo
   EOF
   ```
-- However, not every API services support these features by devault. For example: `AZURE OpenAI`, you have to configure your GPT model in the `.env` file like this.
+- However, not every API services support these features by default. For example: `AZURE OpenAI`, you have to configure your GPT model in the `.env` file like this.
   ```bash
   cat << EOF  > .env
   USE_AZURE=True
@@ -120,6 +128,18 @@ Users must ensure Docker is installed before attempting most scenarios. Please r
   CHAT_MODEL=<replace_it_with_the_name_of_your_azure_chat_model>
   EOF
   ```
+
+- We now support LiteLLM as a backend for integration with multiple LLM providers. If you use LiteLLM Backend to use models, you can configure as follows:
+  ```bash
+  cat << EOF  > .env
+  BACKEND=rdagent.oai.backend.LiteLLMAPIBackend
+  # It can be modified to any model supported by LiteLLM.
+  CHAT_MODEL=gpt-4o
+  EMBEDDING_MODEL=text-embedding-3-small
+  # The backend api_key fully follow the convention of litellm.
+  OPENAI_API_KEY=<replace_with_your_openai_api_key>
+  ```
+  
 - For more configuration information, please refer to the [documentation](https://rdagent.readthedocs.io/en/latest/installation_and_configuration.html).
 
 ### 🚀 Run the Application
@@ -180,23 +200,21 @@ The **[🖥️ Live Demo](https://rdagent.azurewebsites.net/)** is implemented b
   ```bash
   # Generally, you can run the Kaggle competition program with the following command:
   rdagent kaggle --competition <your competition name>
+
+  # Specifically, you need to create a folder for storing competition files (e.g., competition description file, competition datasets, etc.), and configure the path to the folder in your environment. In addition, you need to use chromedriver when you download the competition descriptors, which you can follow for this specific example:
   
-  # Specifically, you will need to first prepare some competition description files and configure the competition description file path, which you can follow for this specific example:
-  
-  # 1. Prepare the competition description files
-  wget https://github.com/SunsetWolf/rdagent_resource/releases/download/kaggle_data/kaggle_data.zip
-  unzip kaggle_data.zip -d git_ignore_folder/kaggle_data
+  # 1. Install chromedriver.
 
   # 2. Add the competition description file path to the `.env` file.
+  mkdir -p ./git_ignore_folder/kaggle_data
   dotenv set KG_LOCAL_DATA_PATH "$(pwd)/git_ignore_folder/kaggle_data"
 
   # 3. run the application
   rdagent kaggle --competition sf-crime
   ```
   > **Description of the above example:** <br />
-  > - Kaggle competition data, contains two parts: competition description file (json file) and competition dataset (zip file). We prepare the competition description file for you, the competition dataset will be downloaded automatically when you run the program, as in the example. <br />
-  > - If you want to download the competition description file automatically, you need to install chromedriver, The instructions for installing chromedriver can be found in the [documentation](https://rdagent.readthedocs.io/en/latest/scens/kaggle_agent.html#example-guide). <br />
-  > - The **Competition List Available** can be found [here](https://rdagent.readthedocs.io/en/latest/scens/kaggle_agent.html#competition-list-available). <br />
+  > - Kaggle competition data is roughly divided into three sections: competition description file (json file) and complete dataset for the competition and simplified dataset for the competition. <br />
+  > - The Kaggle competition data will be downloaded automatically, the download process depends on `chromedriver`, installation instructions can be found in the [documentation](https://rdagent.readthedocs.io/en/latest/scens/kaggle_agent.html#example-guide). <br />
 
 ### 🖥️ Monitor the Application Results
 - You can run the following command for our demo program to see the run logs.
@@ -311,6 +329,10 @@ For more detail, please refer to our **[🖥️ Live Demo page](https://rdagent.
 
 
 # 🤝 Contributing
+
+We welcome contributions and suggestions to improve RD-Agent. Please refer to the [Contributing Guide](CONTRIBUTING.md) for more details on how to contribute.
+
+Before submitting a pull request, ensure that your code passes the automatic CI checks.
 
 ## 📝 Guidelines
 This project welcomes contributions and suggestions.

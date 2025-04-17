@@ -3,6 +3,7 @@ import json
 import pickle
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Dict
 
 import pandas as pd
 from jinja2 import Environment, StrictUndefined
@@ -93,6 +94,7 @@ class KGScenario(Scenario):
             user_prompt=user_prompt,
             system_prompt=sys_prompt,
             json_mode=True,
+            json_target_type=Dict[str, str | bool | int],
         )
 
         response_json_analysis = json.loads(response_analysis)
@@ -105,7 +107,7 @@ class KGScenario(Scenario):
         )
         self.model_output_channel = response_json_analysis.get("Submission channel number to each sample", 1)
         self.evaluation_desc = response_json_analysis.get(
-            "Evaluation Description", "No evaluation specification provided."
+            "Metric Evaluation Description", "No evaluation specification provided."
         )
 
     def get_competition_full_desc(self) -> str:
@@ -116,7 +118,7 @@ class KGScenario(Scenario):
     Competition Features: {self.competition_features}
     Submission Specifications: {self.submission_specifications}
     Model Output Channel: {self.model_output_channel}
-    Evaluation Descriptions: {self.evaluation_desc}
+    Metric Evaluation Description: {self.evaluation_desc}
     Is the evaluation metric the higher the better: {evaluation_direction}
     """
 

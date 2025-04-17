@@ -5,6 +5,9 @@ feature_coder:
 
     ## Task Description
     {{ task_desc }}
+    
+    ## Competition Information for This Task
+    {{ competition_info }}
 
     {% if queried_similar_successful_knowledge|length != 0 or queried_former_failed_knowledge|length != 0 %}
     ## Relevant Information for This Task
@@ -31,24 +34,38 @@ feature_coder:
 
     ## Guidelines
     1. If feature engineering is unnecessary or should be combined with model training, you may skip this step.
-    2. The function input is the output of the following data loader:
+    2. Be cautious of any column drop in the code. Dropping a column easily without any more attempts, it may not be a good practice.
+    3. The function input is the output of the following data loader:
     ```python
     {{ data_loader_code }}
     ```
-    3. **Additional Guidance:**
+    4. **Additional Guidance:**
       - If a previous attempt exists, improve upon it without repeating mistakes.
       - If errors indicate a missing file, find a way to download it or implement an alternative solution.
       - You should avoid using logging module to output information in your generated code, and instead use the print() function.
+    5. You should use the following cache decorator to cache the results of the function:
+    ```python
+    from joblib import Memory
+    memory = Memory(location='/tmp/cache', verbose=0)
+    @memory.cache```
+    6. Coding tricks:
+      - If the input consists of a batch of file paths and you need to modify the file contents to complete your feature engineering task, you can accomplish your feature engineering task by modifying these files and creating new files in a subfolder within "/tmp/cache" (this path is persistent, otherwise you may lose your created file). Then the new file paths are returned.
+
+    {% include "scenarios.data_science.share:guidelines.coding" %}
 
     ## Output Format
+    {% if out_spec %}
+    {{ out_spec }}
+    {% else %}
     Please response the code in the following json format. Here is an example structure for the JSON output:
     {
         "code": "The Python code as a string."
     }
+    {% endif %}
   
   user: |-
-    --------- Feature Processing Specification ---------
-    {{ feature_spec }}
+    --------- Code Specification ---------
+    {{ code_spec }}
 
     {% if latest_code %}
     --------- Former code ---------
