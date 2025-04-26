@@ -22,6 +22,7 @@ from rdagent.components.coder.data_science.workflow import WorkflowCoSTEER
 from rdagent.components.coder.data_science.workflow.exp import WorkflowTask
 from rdagent.components.workflow.conf import BasePropSetting
 from rdagent.components.workflow.rd_loop import RDLoop
+from rdagent.core.conf import RD_AGENT_SETTINGS
 from rdagent.core.exception import CoderError, RunnerError
 from rdagent.core.proposal import ExperimentFeedback
 from rdagent.core.scenario import Scenario
@@ -175,8 +176,8 @@ class DataScienceRDLoop(RDLoop):
             and Path(DS_RD_SETTING.log_archive_path).is_dir()
         ):
             start_archive_datetime = datetime.now()
-            logger.info(f"Archiving log folder after loop {self.loop_idx}")
-            tar_path = (
+            logger.info(f"Archiving log and workspace folder after loop {self.loop_idx}")
+            mid_log_tar_path = (
                 Path(
                     DS_RD_SETTING.log_archive_temp_path
                     if DS_RD_SETTING.log_archive_temp_path
@@ -184,20 +185,49 @@ class DataScienceRDLoop(RDLoop):
                 )
                 / "mid_log.tar"
             )
-            subprocess.run(["tar", "-cf", str(tar_path), "-C", (Path().cwd() / "log"), "."], check=True)
+            mid_workspace_tar_path = (
+                Path(
+                    DS_RD_SETTING.log_archive_temp_path
+                    if DS_RD_SETTING.log_archive_temp_path
+                    else DS_RD_SETTING.log_archive_path
+                )
+                / "mid_workspace.tar"
+            )
+            subprocess.run(["tar", "-cf", str(mid_log_tar_path), "-C", (Path().cwd() / "log"), "."], check=True)
+
+            # remove all files and folders in the workspace except for .py, .md, and .csv files to avoid large workspace dump
+            for workspace_id in Path(RD_AGENT_SETTINGS.workspace_path).iterdir():
+                for file_and_folder in workspace_id.iterdir():
+                    if file_and_folder.is_dir():
+                        shutil.rmtree(file_and_folder)
+                    elif file_and_folder.is_file() and file_and_folder.suffix not in [".py", ".md", ".csv"]:
+                        file_and_folder.unlink()
+
+            subprocess.run(
+                ["tar", "-cf", str(mid_workspace_tar_path), "-C", (RD_AGENT_SETTINGS.workspace_path), "."], check=True
+            )
             if DS_RD_SETTING.log_archive_temp_path is not None:
-                shutil.move(tar_path, Path(DS_RD_SETTING.log_archive_path) / "mid_log.tar")
-                tar_path = Path(DS_RD_SETTING.log_archive_path) / "mid_log.tar"
+                shutil.move(mid_log_tar_path, Path(DS_RD_SETTING.log_archive_path) / "mid_log.tar")
+                mid_log_tar_path = Path(DS_RD_SETTING.log_archive_path) / "mid_log.tar"
+                shutil.move(mid_workspace_tar_path, Path(DS_RD_SETTING.log_archive_path) / "mid_workspace.tar")
+                mid_workspace_tar_path = Path(DS_RD_SETTING.log_archive_path) / "mid_workspace.tar"
             shutil.copy(
-                tar_path, Path(DS_RD_SETTING.log_archive_path) / "mid_log_bak.tar"
+                mid_log_tar_path, Path(DS_RD_SETTING.log_archive_path) / "mid_log_bak.tar"
+            )  # backup when upper code line is killed when running
+            shutil.copy(
+                mid_workspace_tar_path, Path(DS_RD_SETTING.log_archive_path) / "mid_workspace_bak.tar"
             )  # backup when upper code line is killed when running
             self.timer.add_duration(datetime.now() - start_archive_datetime)
 
     @classmethod
     def load(
-        cls, path: Union[str, Path], output_path: Optional[Union[str, Path]] = None, do_truncate: bool = False
+        cls,
+        path: Union[str, Path],
+        output_path: Optional[Union[str, Path]] = None,
+        do_truncate: bool = False,
+        replace_timer: bool = True,
     ) -> "LoopBase":
-        session = super().load(path, output_path, do_truncate)
+        session = super().load(path, output_path, do_truncate, replace_timer)
         if (
             DS_RD_SETTING.enable_knowledge_base
             and DS_RD_SETTING.knowledge_base_version == "v1"
@@ -229,6 +259,7 @@ def main(
     competition="bms-molecular-translation",
     do_truncate=True,
     timeout=None,
+    replace_timer=True,
 ):
     """
 
@@ -271,7 +302,7 @@ def main(
     if path is None:
         kaggle_loop = DataScienceRDLoop(DS_RD_SETTING)
     else:
-        kaggle_loop = DataScienceRDLoop.load(path, output_path, do_truncate)
+        kaggle_loop = DataScienceRDLoop.load(path, output_path, do_truncate, replace_timer)
     kaggle_loop.run(step_n=step_n, loop_n=loop_n, all_duration=timeout)
 
 

@@ -9,6 +9,7 @@ Postscripts:
 """
 
 import datetime
+import os
 import pickle
 import time
 from collections import defaultdict
@@ -16,10 +17,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar, Union, cast
 
+import pytz
 from tqdm.auto import tqdm
 
+from rdagent.core.conf import RD_AGENT_SETTINGS
 from rdagent.log import rdagent_logger as logger
 from rdagent.log.timer import RD_Agent_TIMER_wrapper, RDAgentTimer
+
+if RD_AGENT_SETTINGS.enable_mlflow:
+    import mlflow
 
 
 class LoopMeta(type):
@@ -119,7 +125,27 @@ class LoopBase:
                     if loop_n <= 0:
                         break
 
+                if RD_AGENT_SETTINGS.enable_mlflow:
+                    mlflow.log_metric("loop_index", self.loop_idx)
+                    mlflow.log_metric("step_index", self.step_idx)
+                    current_local_datetime = datetime.datetime.now(pytz.timezone("Asia/Shanghai"))
+                    float_like_datetime = (
+                        current_local_datetime.second
+                        + current_local_datetime.minute * 1e2
+                        + current_local_datetime.hour * 1e4
+                        + current_local_datetime.day * 1e6
+                        + current_local_datetime.month * 1e8
+                        + current_local_datetime.year * 1e10
+                    )
+                    mlflow.log_metric("current_datetime", float_like_datetime)
+
                 if self.timer.started:
+                    if RD_AGENT_SETTINGS.enable_mlflow:
+                        mlflow.log_metric("remain_time", self.timer.remain_time().seconds)  # type: ignore[union-attr]
+                        mlflow.log_metric(
+                            "remain_percent", self.timer.remain_time() / self.timer.all_duration * 100  # type: ignore[operator]
+                        )
+
                     if self.timer.is_timeout():
                         logger.warning("Timeout, exiting the loop.")
                         break
@@ -177,7 +203,11 @@ class LoopBase:
 
     @classmethod
     def load(
-        cls, path: Union[str, Path], output_path: Optional[Union[str, Path]] = None, do_truncate: bool = False
+        cls,
+        path: Union[str, Path],
+        output_path: Optional[Union[str, Path]] = None,
+        do_truncate: bool = False,
+        replace_timer: bool = True,
     ) -> "LoopBase":
         path = Path(path)
         with path.open("rb") as f:
@@ -198,8 +228,13 @@ class LoopBase:
             logger.storage.truncate(time=session.loop_trace[max_loop][-1].end)
 
         if session.timer.started:
-            RD_Agent_TIMER_wrapper.replace_timer(session.timer)
-            RD_Agent_TIMER_wrapper.timer.restart_by_remain_time()
+            if replace_timer:
+                RD_Agent_TIMER_wrapper.replace_timer(session.timer)
+                RD_Agent_TIMER_wrapper.timer.restart_by_remain_time()
+            else:
+                # Use the default timer to replace the session timer
+                session.timer = RD_Agent_TIMER_wrapper.timer
+
         return session
 
 
