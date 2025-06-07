@@ -9,7 +9,6 @@ from itertools import chain
 from pathlib import Path
 
 import nbformat
-from jinja2 import Environment, StrictUndefined
 from rich import print
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -196,6 +195,14 @@ def leaderboard_scores(competition: str) -> list[float]:
     api.authenticate()
     ll = api.competition_leaderboard_view(competition)
     return [float(x.score) for x in ll]
+
+
+def get_metric_direction(competition: str) -> bool:
+    """
+    Return **True** if the metric is *bigger is better*, **False** if *smaller is better*.
+    """
+    leaderboard = leaderboard_scores(competition)
+    return float(leaderboard[0]) > float(leaderboard[-1])
 
 
 def score_rank(competition: str, score: float) -> tuple[int, float]:

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-# TODO: use pydantic for other modules in Qlib
 from pathlib import Path
 from typing import cast
 
@@ -45,11 +44,6 @@ class ExtendedBaseSettings(BaseSettings):
 
 
 class RDAgentSettings(ExtendedBaseSettings):
-    # TODO: (xiao) I think LLMSetting may be a better name.
-    # TODO: (xiao) I think most of the config should be in oai.config
-    # Log configs
-    # TODO: (xiao) think it can be a separate config.
-    log_trace_path: str | None = None
 
     # azure document intelligence configs
     azure_document_intelligence_key: str = ""
@@ -81,6 +75,8 @@ class RDAgentSettings(ExtendedBaseSettings):
     stdout_line_len: int = 10000
 
     enable_mlflow: bool = False
+
+    initial_fator_library_size: int = 20
 
 
 RD_AGENT_SETTINGS = RDAgentSettings()

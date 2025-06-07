@@ -5,7 +5,7 @@ from collections.abc import Generator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, Optional, Union
+from typing import Literal, Optional
 
 
 @dataclass
@@ -43,10 +43,8 @@ class Storage:
     def log(
         self,
         obj: object,
-        name: str = "",
-        save_type: Literal["json", "text", "pkl"] = "text",
+        tag: str = "",
         timestamp: datetime | None = None,
-        **kwargs: dict,
     ) -> str | Path:
         """
 
@@ -66,14 +64,21 @@ class Storage:
         ...
 
     @abstractmethod
-    def iter_msg(self, watch: bool = False) -> Generator[Message, None, None]:
+    def iter_msg(self) -> Generator[Message, None, None]:
         """
-        Parameters
-        ----------
-        watch : bool
-            should we watch the new content and display them
+        Iterate the message in the storage.
         """
         ...
+
+    @abstractmethod
+    def truncate(self, time: datetime) -> None:
+        """
+        Remove all log entries after the specified time.
+        """
+        ...
+
+    def __str__(self) -> str:
+        return self.__class__.__name__
 
 
 class View:

@@ -49,6 +49,8 @@ evolving_strategy_factor_implementation_v1_system: |-
   
   Your must write your code based on your former latest attempt below which consists of your former code and code feedback, you should read the former attempt carefully and must not modify the right part of your former code.
 
+  Notice that you should not add any other text before or after the json format.
+
   {% if queried_former_failed_knowledge|length != 0 %}
   --------------Your former latest attempt:---------------
   =====Code to the former implementation=====
@@ -115,6 +117,9 @@ evolving_strategy_error_summary_v2_system: |-
   Please refer to these similar errors and their solutions, provide some clear, short and accurate critics that might help you solve the issues in your code.
 
   You suggestion should not include any code, just some clear and short suggestions. Please point out very critical issues in your response, ignore non-important issues to avoid confusion. If no big issue found in the code, you can response "No critics found".
+
+  [NOTE]
+  1. When processing data, avoid time leakage.
 
   Please response the critic in the following format. Here is an example structure for the output:
   critic 1: The critic message to critic 1
@@ -185,7 +190,7 @@ evaluator_final_decision_v1_system: |-
   The implementation final decision is considered in the following logic:
   1. If the value and the ground truth value are exactly the same under a small tolerance, the implementation is considered correct.
   2. If the value and the ground truth value have a high correlation on ic or rank ic, the implementation is considered correct.
-  3. If no ground truth value is provided, the implementation is considered correct if the code executes successfully (assuming the data provided is correct). Any exceptions, including those actively raised, are considered faults of the code. Additionally, the code feedback must align with the scenario and factor description.
+  3. If no ground truth value is provided, the implementation is considered correct if the code executes successfully (assuming the data provided is correct). Any exceptions, including those actively raised, are considered faults of the code. Additionally, the code feedback must align with the scenario and factor description. The implementation cannot be considered correct if the code execution failed, no matter what the reason is.
 
   Please response the critic in the json format. Here is an example structure for the JSON output, please strictly follow the format:
   {

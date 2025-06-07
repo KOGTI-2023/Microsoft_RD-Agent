@@ -5,6 +5,7 @@ Pipfile
 public
 release-notes.md
 typescript*
+qlib
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -112,6 +113,7 @@ celerybeat.pid
 
 # Environments
 .env*
+*.env
 .venv
 ^env/
 venv/
@@ -173,3 +175,7 @@ mlruns/
 /*.sh
 .aider*
 rdagent/app/benchmark/factor/example.json
+
+# UI Server resources
+videos/
+static/

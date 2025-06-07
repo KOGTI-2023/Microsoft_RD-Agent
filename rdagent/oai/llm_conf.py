@@ -17,6 +17,13 @@ class LLMSettings(ExtendedBaseSettings):
 
     reasoning_effort: Literal["low", "medium", "high"] | None = None
 
+    # Handling format
+    reasoning_think_rm: bool = False
+    """
+    Some LLMs include <think>...</think> tags in their responses, which can interfere with the main output.
+    Set reasoning_think_rm to True to remove any <think>...</think> content from responses.
+    """
+
     # TODO: most of the settings are only used on deprec.DeprecBackend.
     # So they should move the settings to that folder.
 
@@ -37,6 +44,8 @@ class LLMSettings(ExtendedBaseSettings):
     use_embedding_cache: bool = False
     prompt_cache_path: str = str(Path.cwd() / "prompt_cache.db")
     max_past_message_include: int = 10
+    timeout_fail_limit: int = 10
+    violation_fail_limit: int = 1
 
     # Behavior of returning answers to the same question when caching is enabled
     use_auto_chat_cache_seed_gen: bool = False

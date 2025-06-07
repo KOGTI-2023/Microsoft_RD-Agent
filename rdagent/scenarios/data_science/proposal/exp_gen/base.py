@@ -1,5 +1,5 @@
 from abc import abstractmethod
-from typing import Literal
+from typing import List, Literal
 
 from rdagent.app.data_science.conf import DS_RD_SETTING
 from rdagent.core.evolving_framework import KnowledgeBase
@@ -12,14 +12,14 @@ class DSHypothesis(Hypothesis):
     def __init__(
         self,
         component: COMPONENT,
-        hypothesis: str = "",
-        reason: str = "",
-        concise_reason: str = "",
-        concise_observation: str = "",
-        concise_justification: str = "",
-        concise_knowledge: str = "",
-        problem_name: str = "",
-        problem_desc: str = "",
+        hypothesis: str | None = None,
+        reason: str | None = None,
+        concise_reason: str | None = None,
+        concise_observation: str | None = None,
+        concise_justification: str | None = None,
+        concise_knowledge: str | None = None,
+        problem_name: str | None = None,
+        problem_desc: str | None = None,
         problem_label: Literal["SCENARIO_PROBLEM", "FEEDBACK_PROBLEM"] = "FEEDBACK_PROBLEM",
     ) -> None:
         super().__init__(
@@ -31,20 +31,22 @@ class DSHypothesis(Hypothesis):
         self.problem_label = problem_label
 
     def __str__(self) -> str:
-        if self.hypothesis == "":
+        if self.hypothesis is None:
             return f"No hypothesis available. Trying to construct the first runnable {self.component} component."
+
         lines = []
-        if self.problem_name is not None and self.problem_desc is not None:
-            lines.append(f"Target Problem name: {self.problem_name}")
+        if self.problem_name is not None:
+            lines.append(f"Target Problem Name: {self.problem_name}")
+        if self.problem_desc is not None:
             lines.append(f"Target Problem: {self.problem_desc}")
-        lines.extend(
-            [f"Chosen Component: {self.component}", f"Hypothesis: {self.hypothesis}", f"Reason: {self.reason}"]
-        )
+        lines.append(f"Chosen Component: {self.component}")
+        lines.append(f"Hypothesis: {self.hypothesis}")
+        if self.reason is not None:
+            lines.append(f"Reason: {self.reason}")
         return "\n".join(lines)
 
 
 class DSTrace(Trace[DataScienceScen, KnowledgeBase]):
-
     def __init__(self, scen: DataScienceScen, knowledge_base: KnowledgeBase | None = None) -> None:
         self.scen: DataScienceScen = scen
         self.hist: list[tuple[DSExperiment, ExperimentFeedback]] = []
@@ -57,16 +59,37 @@ class DSTrace(Trace[DataScienceScen, KnowledgeBase]):
         # () represents no parent; (1,) presents one parent; (1, 2) represents two parents.
 
         self.knowledge_base = knowledge_base
-
         self.current_selection: tuple[int, ...] = (-1,)
+
+        self.sota_exp_to_submit: DSExperiment | None = None  # grab the global best exp to submit
 
     COMPLETE_ORDER = ("DataLoadSpec", "FeatureEng", "Model", "Ensemble", "Workflow")
 
-    def get_current_selection(self) -> tuple[int, ...]:
-        return self.current_selection
+    def set_sota_exp_to_submit(self, exp: DSExperiment) -> None:
+        self.sota_exp_to_submit = exp
 
-    def set_current_selection(self, selection: tuple[int, ...]) -> None:
-        self.current_selection = selection
+    @property
+    def sub_trace_count(self) -> int:
+        return len(self.get_leaves())
+
+    def get_leaves(self) -> list[int, ...]:
+        """
+        Get the indices of nodes (in hist) that have no children—i.e., "leaves" of current DAG.
+        Returns:
+            tuple of ints: Indices of leaf nodes.
+            - Leaves with lower index comes first.
+        """
+        # BUG: potential BUG:
+        # If we implement the most correct merging logic,  merge 2 traces, will result in a single trace(2 traces currently).
+        # So user may get unexpected results when he want to know ho many branches are created.
+
+        # Build a set of all parent indices found in dag_parent (skip empty tuples which represent roots)
+        parent_indices = set(idx for parents in self.dag_parent for idx in parents)
+        # All node indices
+        all_indices = set(range(len(self.hist)))
+        # The leaf nodes have no children, so they are not present as parents of any other node
+        leaves = list(sorted(all_indices - parent_indices))
+        return leaves
 
     def sync_dag_parent_and_hist(
         self,
@@ -90,7 +113,9 @@ class DSTrace(Trace[DataScienceScen, KnowledgeBase]):
             self.dag_parent.append((current_node_idx,))
 
     def retrieve_search_list(
-        self, search_type: Literal["all", "ancestors"] = "ancestors"
+        self,
+        search_type: Literal["all", "ancestors"] = "ancestors",
+        selection: tuple[int, ...] | None = None,
     ) -> list[tuple[DSExperiment, ExperimentFeedback]]:
         """
         Retrieve the search list based on the selection and search_type.
@@ -107,42 +132,14 @@ class DSTrace(Trace[DataScienceScen, KnowledgeBase]):
         list[tuple[DSExperiment, ExperimentFeedback]]
             The search list.
         """
+        if search_type == "all":
+            return self.hist
 
-        selection = self.get_current_selection()
-        if selection is None:
-            # selection is None, which means we switch to a new trace, which is not implemented yet
-            return []
-
-        return self.collect_all_ancestors(selection) if search_type == "ancestors" else self.hist
-
-    def collect_all_ancestors(
-        self,
-        selection: tuple[int, ...] = (-1,),
-    ) -> list[tuple[DSExperiment, ExperimentFeedback]]:
-        """
-        Collect all ancestors of the given selection.
-        The return list follows the order of [root->...->parent->current_node].
-        """
-
-        if len(self.dag_parent) == 0:
-            return []
+        elif search_type == "ancestors":
+            return self.get_parent_exps(selection)
 
         else:
-            all_ancestors = []
-
-            # start from the latest selection
-            current_node_idx = selection[0]
-
-            # add the current node to the list
-            all_ancestors.insert(0, self.hist[current_node_idx])
-
-            parent_idx = self.dag_parent[current_node_idx]
-
-            while len(parent_idx) > 0:
-                all_ancestors.insert(0, self.hist[parent_idx[0]])
-                parent_idx = self.dag_parent[parent_idx[0]]
-
-        return all_ancestors
+            raise ValueError(f"Invalid search type: {search_type}")
 
     def next_incomplete_component(
         self,
@@ -175,46 +172,71 @@ class DSTrace(Trace[DataScienceScen, KnowledgeBase]):
         self,
         return_type: Literal["sota", "failed", "all"],
         search_type: Literal["all", "ancestors"] = "all",
+        selection: tuple[int, ...] | None = None,
+        max_retrieve_num: int | None = None,
     ) -> list[tuple[DSExperiment, ExperimentFeedback]]:
         """
         Retrieve a list of experiments and feedbacks based on the return_type.
         """
-        search_list = self.retrieve_search_list(search_type)
-
+        search_list = self.retrieve_search_list(search_type, selection=selection)
         final_component = self.COMPLETE_ORDER[-1]
         has_final_component = True if DS_RD_SETTING.coder_on_whole_pipeline else False
-        exp_and_feedback_list = []
+        SOTA_exp_and_feedback_list = []
+        failed_exp_and_feedback_list = []
         for exp, fb in search_list:
             if has_final_component:
-                if return_type == "all":
-                    exp_and_feedback_list.append((exp, fb))
-                elif return_type == "failed" and not fb.decision:
-                    exp_and_feedback_list.append((exp, fb))
-                elif return_type == "sota" and fb.decision:
-                    exp_and_feedback_list.append((exp, fb))
+                if fb.decision:
+                    SOTA_exp_and_feedback_list.append((exp, fb))
+                    failed_exp_and_feedback_list = []
+                else:
+                    failed_exp_and_feedback_list.append((exp, fb))
             if exp.hypothesis.component == final_component and fb:
                 has_final_component = True
-        return exp_and_feedback_list
+        if max_retrieve_num is not None and (SOTA_exp_and_feedback_list or failed_exp_and_feedback_list):
+            SOTA_exp_and_feedback_list = SOTA_exp_and_feedback_list[
+                -min(max_retrieve_num, len(SOTA_exp_and_feedback_list)) :
+            ]
+            failed_exp_and_feedback_list = failed_exp_and_feedback_list[
+                -min(max_retrieve_num, len(failed_exp_and_feedback_list)) :
+            ]
+        if return_type == "all":
+            return SOTA_exp_and_feedback_list + failed_exp_and_feedback_list
+        elif return_type == "failed":
+            return failed_exp_and_feedback_list
+        elif return_type == "sota":
+            return SOTA_exp_and_feedback_list
+        else:
+            raise ValueError("Invalid return_type. Must be 'sota', 'failed', or 'all'.")
 
-    def sota_experiment(
+    def sota_experiment_fb(
         self,
         search_type: Literal["all", "ancestors"] = "ancestors",
-    ) -> DSExperiment | None:
+        selection: tuple[int, ...] | None = None,
+    ) -> tuple[DSExperiment, ExperimentFeedback] | None:
         """
-
         Returns
         -------
         Experiment or None
             The experiment result if found, otherwise None.
         """
-        search_list = self.retrieve_search_list(search_type)
+        search_list = self.retrieve_search_list(search_type, selection=selection)
 
         if DS_RD_SETTING.coder_on_whole_pipeline or self.next_incomplete_component() is None:
             for exp, ef in search_list[::-1]:
                 # the sota exp should be accepted decision and all required components are completed.
                 if ef.decision:
-                    return exp
+                    return exp, ef
         return None
+
+    def sota_experiment(
+        self,
+        search_type: Literal["all", "ancestors"] = "ancestors",
+        selection: tuple[int, ...] | None = None,
+    ) -> DSExperiment | None:
+        res = self.sota_experiment_fb(search_type=search_type, selection=selection)
+        if res is not None:
+            res = res[0]
+        return res
 
     def last_successful_exp(
         self,
@@ -237,10 +259,20 @@ class DSTrace(Trace[DataScienceScen, KnowledgeBase]):
         """
         Access the last experiment
         """
-        search_list = self.retrieve_search_list(search_type)
+        if (last_exp_fb := self.last_exp_fb(search_type=search_type)) is not None:
+            return last_exp_fb[0]
+        return None
 
+    def last_exp_fb(
+        self,
+        search_type: Literal["all", "ancestors"] = "ancestors",
+    ) -> tuple[DSExperiment, ExperimentFeedback] | None:
+        """
+        Access the last experiment and feedback
+        """
+        search_list = self.retrieve_search_list(search_type)
         for exp, ef in search_list[::-1]:
-            return exp
+            return exp, ef
         return None
 
     def last_runnable_exp_fb(
