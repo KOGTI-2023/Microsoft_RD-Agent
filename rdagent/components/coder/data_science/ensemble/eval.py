@@ -47,7 +47,10 @@ class EnsembleCoSTEEREvaluator(CoSTEEREvaluator):
                 final_decision=False,
             )
 
-        env = get_ds_env(extra_volumes={self.scen.debug_path: T("scenarios.data_science.share:scen.input_path").r()})
+        env = get_ds_env(
+            extra_volumes={self.scen.debug_path: T("scenarios.data_science.share:scen.input_path").r()},
+            running_timeout_period=self.scen.real_debug_timeout(),
+        )
 
         fname = "test/ensemble_test.txt"
         test_code = (DIRNAME / "eval_tests" / "ensemble_test.txt").read_text()
@@ -63,7 +66,9 @@ class EnsembleCoSTEEREvaluator(CoSTEEREvaluator):
         )
 
         implementation.inject_files(**{fname: test_code})
-        stdout, ret_code = implementation.execute_ret_code(env=env, entry=f"python {fname}")
+        result = implementation.run(env=env, entry=f"python {fname}")
+        stdout = result.get_truncated_stdout()
+        ret_code = result.exit_code
 
         stdout += f"\nNOTE: the above scripts run with return code {ret_code}"
 

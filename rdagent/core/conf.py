@@ -55,6 +55,12 @@ class RDAgentSettings(ExtendedBaseSettings):
 
     # workspace conf
     workspace_path: Path = Path.cwd() / "git_ignore_folder" / "RD-Agent_workspace"
+    workspace_ckp_size_limit: int = 0
+    workspace_ckp_white_list_names: list[str] | None = None
+    """
+    the checkpoint for the workspace is a zip file.
+    0 (or any value <=0) means *no* size limit for files in workspace checkpoints
+    """
 
     # multi processing conf
     multi_proc_n: int = 1
@@ -77,6 +83,27 @@ class RDAgentSettings(ExtendedBaseSettings):
     enable_mlflow: bool = False
 
     initial_fator_library_size: int = 20
+
+    # parallel loop
+    step_semaphore: int | dict[str, int] = 1
+    """the semaphore for each step;  you can specify a overall semaphore
+    or a step-wise semaphore like {"coding": 3, "running": 2}"""
+
+    def get_max_parallel(self) -> int:
+        """Based on the setting of semaphore, return the maximum number of parallel loops"""
+        if isinstance(self.step_semaphore, int):
+            return self.step_semaphore
+        return max(self.step_semaphore.values())
+
+    # NOTE: for debug
+    # the following function only serves as debugging and is necessary in main logic.
+    subproc_step: bool = False
+
+    def is_force_subproc(self) -> bool:
+        return self.subproc_step or self.get_max_parallel() > 1
+
+    # Template:
+    app_tpl: str | None = None  # for application to override the default template, example: "app/fintune/tpl"
 
 
 RD_AGENT_SETTINGS = RDAgentSettings()

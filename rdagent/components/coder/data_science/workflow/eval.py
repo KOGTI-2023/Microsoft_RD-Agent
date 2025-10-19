@@ -55,7 +55,10 @@ class WorkflowGeneralCaseSpecEvaluator(CoSTEEREvaluator):
                 final_decision=False,
             )
 
-        env = get_ds_env(extra_volumes={self.scen.debug_path: T("scenarios.data_science.share:scen.input_path").r()})
+        env = get_ds_env(
+            extra_volumes={self.scen.debug_path: T("scenarios.data_science.share:scen.input_path").r()},
+            running_timeout_period=self.scen.real_debug_timeout(),
+        )
 
         # # DockerEnv for MLEBench submission validation
         # mle_de_conf = MLEBDockerConf()
@@ -102,8 +105,8 @@ class WorkflowGeneralCaseSpecEvaluator(CoSTEEREvaluator):
                     score_check_text += f"\n[Error] The scores dataframe does not contain the correct model names as index.\ncorrect model names are: {model_set_in_folder.union({'ensemble'})}\nscore_df is:\n{score_df}"
                     score_ret_code = 1
 
-                # Check metric name (columns)
-                if score_df.columns.tolist() != [self.scen.metric_name]:
+                # Check metric name (columns) - case insensitive
+                if [col.lower() for col in score_df.columns.tolist()] != [self.scen.metric_name.lower()]:
                     score_check_text += f"\n[Error] The scores dataframe does not contain the correct column names.\nCorrect columns is: ['{self.scen.metric_name}']\nBut got: {score_df.columns.tolist()}"
                     score_ret_code = 1
 
@@ -121,9 +124,9 @@ class WorkflowGeneralCaseSpecEvaluator(CoSTEEREvaluator):
         base_check_code = T(".eval_tests.submission_format_test", ftype="txt").r()
         implementation.inject_files(**{"test/submission_format_test.py": base_check_code})
         # stdout += "----Submission Check 1-----\n"
-        submission_check_out, submission_ret_code = implementation.execute_ret_code(
-            env=env, entry="python test/submission_format_test.py"
-        )
+        submission_result = implementation.run(env=env, entry="python test/submission_format_test.py")
+        submission_check_out = submission_result.get_truncated_stdout()
+        submission_ret_code = submission_result.exit_code
         stdout += "\n" + submission_check_out
 
         system_prompt = T(".prompts:workflow_eval.system").r(

@@ -8,7 +8,7 @@ loguru
 fire
 fuzzywuzzy
 openai
-litellm
+litellm>=1.73  # to support `from litellm import get_valid_models`
 azure.identity
 pyarrow
 rich
@@ -41,17 +41,18 @@ python-dotenv
 docker
 
 # demo related
-streamlit
+streamlit>=1.47  # to support  input_c.text_area(..., height="content", ...)
 plotly
 st-theme
 randomname
 flask
 flask-cors
+networkx
 
 # kaggle crawler
 selenium
 kaggle
-nbformat
+nbformat # also used for notebook conversion
 
 # tool
 setuptools-scm
@@ -66,3 +67,7 @@ genson
 mlflow
 azureml-mlflow
 types-pytz
+
+# Agent
+pydantic-ai-slim[mcp,openai,prefect]
+nest-asyncio

@@ -1,21 +1,26 @@
 from __future__ import annotations
 
+import io
 import os
 import platform
 import re
 import shutil
 import typing
 import uuid
+import zipfile
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from rdagent.core.conf import RD_AGENT_SETTINGS
 from rdagent.core.evaluation import Feedback
-from rdagent.utils import filter_redundant_text
-from rdagent.utils.fmt import shrink_text
+
+if TYPE_CHECKING:
+    from rdagent.utils.env import EnvResult
+
 
 if typing.TYPE_CHECKING:
     from rdagent.core.proposal import Hypothesis
@@ -43,13 +48,27 @@ class AbsTask(ABC):
         """
 
 
+class UserInstructions(list[str]):
+    def __str__(self) -> str:
+        if self:
+            return ("\nUser Instructions (Top priority!):\n" + "\n".join(f"- {ui}" for ui in self)) if self else ""
+        return ""
+
+
 class Task(AbsTask):
-    def __init__(self, name: str, version: int = 1, description: str = "") -> None:
+    def __init__(
+        self,
+        name: str,
+        version: int = 1,
+        description: str = "",
+        user_instructions: UserInstructions | None = None,
+    ) -> None:
         super().__init__(name, version)
         self.description = description
+        self.user_instructions = user_instructions
 
     def get_task_information(self) -> str:
-        return f"Task Name: {self.name}\nDescription: {self.description}"
+        return f"Task Name: {self.name}\nDescription: {self.description}{self.user_instructions!s}"
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__} {self.name}>"
@@ -57,6 +76,12 @@ class Task(AbsTask):
 
 ASpecificTask = TypeVar("ASpecificTask", bound=Task)
 ASpecificFeedback = TypeVar("ASpecificFeedback", bound=Feedback)
+
+
+@dataclass
+class RunningInfo:
+    result: object = None  # The result of the experiment, can be different types in different scenarios.
+    running_time: float | None = None
 
 
 class Workspace(ABC, Generic[ASpecificTask, ASpecificFeedback]):
@@ -68,6 +93,7 @@ class Workspace(ABC, Generic[ASpecificTask, ASpecificFeedback]):
     def __init__(self, target_task: ASpecificTask | None = None) -> None:
         self.target_task: ASpecificTask | None = target_task
         self.feedback: ASpecificFeedback | None = None
+        self.running_info: RunningInfo = RunningInfo()
 
     @abstractmethod
     def execute(self, *args: Any, **kwargs: Any) -> object | None:
@@ -84,6 +110,19 @@ class Workspace(ABC, Generic[ASpecificTask, ASpecificFeedback]):
     def all_codes(self) -> str:
         """
         Get all the code files in the workspace as a single string.
+        """
+
+    # when the workspace is mutable inplace, provide support for creating checkpoints and recovering.
+    @abstractmethod
+    def create_ws_ckp(self) -> None:
+        """
+        Create an in-memory checkpoint of the workspace so it can be restored later.
+        """
+
+    @abstractmethod
+    def recover_ws_ckp(self) -> None:
+        """
+        Restore the workspace from the checkpoint created by :py:meth:`create_ws_ckp`.
         """
 
 
@@ -126,6 +165,8 @@ class FBWorkspace(Workspace):
             {}
         )  # The code injected into the folder, store them in the variable to reproduce the former result
         self.workspace_path: Path = RD_AGENT_SETTINGS.workspace_path / uuid.uuid4().hex
+        self.ws_ckp: bytes | None = None  # In-memory checkpoint data created by ``create_ws_ckp``.
+        self.change_summary: str | None = None  # The change from the previous version of workspace
 
     @staticmethod
     def _format_code_dict(code_dict: dict[str, str]) -> str:
@@ -172,8 +213,8 @@ class FBWorkspace(Workspace):
             workspace_data_file_path = workspace_path / data_file_path.name
             if workspace_data_file_path.exists():
                 workspace_data_file_path.unlink()
-            if platform.system() == "Linux":
-                os.symlink(data_file_path, workspace_data_file_path)
+            if platform.system() in ("Linux", "Darwin"):
+                workspace_data_file_path.symlink_to(data_file_path)
             if platform.system() == "Windows":
                 os.link(data_file_path, workspace_data_file_path)
 
@@ -250,26 +291,74 @@ class FBWorkspace(Workspace):
         """
         Before each execution, make sure to prepare and inject code.
         """
-        stdout, _ = self.execute_ret_code(env, entry)
-        return stdout
+        result = self.run(env, entry)
+        return result.get_truncated_stdout()  # NOTE: truncating just for aligning with the old code.
 
-    def execute_ret_code(self, env: Env, entry: str) -> tuple[str, int]:
+    def run(self, env: Env, entry: str) -> EnvResult:
         """
-        Execute the code in the environment and return both the stdout and the exit code.
+        Execute the code in the environment and return an EnvResult object (stdout, exit_code, running_time).
 
         Before each execution, make sure to prepare and inject code.
         """
         self.prepare()
         self.inject_files(**self.file_dict)
-        stdout, return_code = env.run_ret_code(entry, str(self.workspace_path), env={"PYTHONPATH": "./"})
-        return (
-            shrink_text(
-                filter_redundant_text(stdout),
-                context_lines=RD_AGENT_SETTINGS.stdout_context_len,
-                line_len=RD_AGENT_SETTINGS.stdout_line_len,
-            ),
-            return_code,
-        )
+        return env.run(entry, str(self.workspace_path), env={"PYTHONPATH": "./"})
+
+    def create_ws_ckp(self) -> None:
+        """
+        Zip the contents of ``workspace_path`` and persist the archive on
+        ``self.ws_ckp`` for later restoration via :py:meth:`recover_ws_ckp`.
+        """
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for file_path in self.workspace_path.rglob("*"):
+                # Only include regular files up to 100 KB so that the checkpoint
+                # remains lightweight. Larger files (for example, datasets) are
+                # expected to be recreated or mounted separately.
+                if file_path.is_symlink():
+                    # Preserve symbolic links within the archive
+                    zi = zipfile.ZipInfo(str(file_path.relative_to(self.workspace_path)))
+                    zi.create_system = 3  # indicates Unix
+                    zi.external_attr = 0o120777 << 16  # symlink file type + 0777 perms
+                    zf.writestr(zi, str(file_path.readlink()))
+                elif file_path.is_file():
+                    size_limit = RD_AGENT_SETTINGS.workspace_ckp_size_limit
+                    if (
+                        RD_AGENT_SETTINGS.workspace_ckp_white_list_names is not None
+                        and file_path.name in RD_AGENT_SETTINGS.workspace_ckp_white_list_names
+                    ) or (size_limit <= 0 or file_path.stat().st_size <= size_limit):
+                        zf.write(file_path, file_path.relative_to(self.workspace_path))
+        self.ws_ckp = buf.getvalue()
+
+    def recover_ws_ckp(self) -> None:
+        """
+        Restore the workspace directory from the in-memory checkpoint created by
+        :py:meth:`create_ws_ckp`.
+        """
+        if self.ws_ckp is None:
+            msg = "Workspace checkpoint doesn't exist. Call `create_ws_ckp` first."
+            raise RuntimeError(msg)
+        shutil.rmtree(self.workspace_path, ignore_errors=True)
+        self.workspace_path.mkdir(parents=True, exist_ok=True)
+        buf = io.BytesIO(self.ws_ckp)
+        with zipfile.ZipFile(buf, "r") as zf:
+            for info in zf.infolist():
+                dest_path = self.workspace_path / info.filename
+                # File type bits (upper 4) are in high 16 bits of external_attr
+                mode = (info.external_attr >> 16) & 0o170000
+                symlink_mode = 0o120000  # Constant for symlink file type in Unix
+                if mode == symlink_mode:  # Symlink
+                    dest_path.parent.mkdir(parents=True, exist_ok=True)
+                    link_target = zf.read(info).decode()
+                    dest_path.symlink_to(link_target)
+                elif info.is_dir():
+                    dest_path.mkdir(parents=True, exist_ok=True)
+                else:
+                    dest_path.parent.mkdir(parents=True, exist_ok=True)
+                    with dest_path.open("wb") as f:
+                        f.write(zf.read(info))
+        # NOTE: very important to reduce the size of the object
+        self.ws_ckp = None
 
     def __str__(self) -> str:
         return f"Workspace[{self.workspace_path=}" + (
@@ -279,6 +368,12 @@ class FBWorkspace(Workspace):
 
 ASpecificWSForExperiment = TypeVar("ASpecificWSForExperiment", bound=Workspace)
 ASpecificWSForSubTasks = TypeVar("ASpecificWSForSubTasks", bound=Workspace)
+
+
+class ExperimentPlan(dict[str, Any]):
+    """
+    A plan for the experiment, which is a dictionary that contains the plan to each stage.
+    """
 
 
 class Experiment(
@@ -319,13 +414,63 @@ class Experiment(
         # NOTE: Assumption
         # - only runner will assign this variable
         # - We will always create a new Experiment without copying previous results when we goto the next new loop.
-        self.result: object = None  # The result of the experiment, can be different types in different scenarios.
+        self.running_info = RunningInfo()
         self.sub_results: dict[str, float] = (
             {}
         )  # TODO: in Kaggle, now sub results are all saved in self.result, remove this in the future.
 
+        # For parallel multi-trace support
+        self.local_selection: tuple[int, ...] | None = None
+        self.plan: ExperimentPlan | None = (
+            None  # To store the planning information for this experiment, should be generated inside exp_gen.gen
+        )
+        self.user_instructions: UserInstructions | None = None  # To store the user instructions for this experiment
+
+    def set_user_instructions(self, user_instructions: UserInstructions | None) -> None:
+        if user_instructions is None:
+            return
+        if not isinstance(user_instructions, UserInstructions) and isinstance(user_instructions, list):
+            user_instructions = UserInstructions(user_instructions)
+        self.user_instructions = user_instructions
+        for ws in self.sub_workspace_list:
+            if ws is not None:
+                ws.target_task.user_instructions = user_instructions  # type: ignore[union-attr]
+        for task in self.sub_tasks:
+            task.user_instructions = user_instructions
+        if self.experiment_workspace is not None and self.experiment_workspace.target_task is not None:
+            self.experiment_workspace.target_task.user_instructions = user_instructions
+
+    @property
+    def result(self) -> object:
+        return self.running_info.result
+
+    @result.setter
+    def result(self, value: object) -> None:
+        self.running_info.result = value
+
+    # when the workspace is mutable inplace, provide support for creating checkpoints and recovering.
+    def create_ws_ckp(self) -> None:
+        if self.experiment_workspace is not None:
+            self.experiment_workspace.create_ws_ckp()
+        for ws in self.sub_workspace_list:
+            if ws is not None:
+                ws.create_ws_ckp()
+
+    def recover_ws_ckp(self) -> None:
+        if self.experiment_workspace is not None:
+            self.experiment_workspace.recover_ws_ckp()
+        for ws in self.sub_workspace_list:
+            if ws is not None:
+                try:
+                    ws.recover_ws_ckp()
+                except RuntimeError:
+                    # the FBWorkspace is shared between experiment_workspace and sub_workspace_list,
+                    # so recover_ws_ckp will raise RuntimeError if a workspace is recovered twice.
+                    print("recover_ws_ckp failed due to one workspace is recovered twice.")
+
 
 ASpecificExp = TypeVar("ASpecificExp", bound=Experiment)
+ASpecificPlan = TypeVar("ASpecificPlan", bound=ExperimentPlan)
 
 TaskOrExperiment = TypeVar("TaskOrExperiment", Task, Experiment)
 

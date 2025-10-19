@@ -7,8 +7,10 @@ We think this part can be shared.
 import json
 import re
 from abc import abstractclassmethod
+from pathlib import Path
 from typing import Any
 
+from rdagent.utils.agent.apply_patch import apply_patch_from_text
 from rdagent.utils.agent.tpl import T
 
 
@@ -17,7 +19,7 @@ class AgentOut:
 
     @abstractclassmethod
     def get_spec(cls, **context: Any) -> str:
-        raise NotImplementedError(f"Please implement the `get_spec` method")
+        raise NotImplementedError("Please implement the `get_spec` method")
 
     @classmethod
     def extract_output(cls, resp: str) -> Any:
@@ -31,7 +33,8 @@ class PythonAgentOut(AgentOut):
 
     @classmethod
     def extract_output(cls, resp: str):
-        match = re.search(r".*```[Pp]ython\n(.*)\n```.*", resp, re.DOTALL)
+        # We use lazy mode (.*?) to only extract the first code block in the response.
+        match = re.search(r".*```[Pp]ython\n(.*?)\n```.*", resp, re.DOTALL)
         if match:
             code = match.group(1)
             code = re.sub(r"</?code>", "", code, flags=re.IGNORECASE)
@@ -80,4 +83,22 @@ class PythonBatchEditOut(AgentOut):
             file_name, code = match
             code_blocks[file_name.strip()] = code.strip()
 
+        return code_blocks
+
+
+class PythonBatchPatchOut(AgentOut):
+    @classmethod
+    def get_spec(cls):
+        return T(".tpl:PythonBatchPatchOut").r()
+
+    @classmethod
+    def extract_output(cls, resp: str, prefix: Path | None = None) -> str:
+        code_blocks = {}
+        # Step 1: extract patch by pattern
+        patch_pattern = re.compile(r"(\*\*\* Begin Patch\s*(.*?)\s*\*\*\* End Patch)", re.DOTALL)
+        matches = patch_pattern.findall(resp)
+        for match in matches:
+            code_blocks.update(apply_patch_from_text(match[0], inplace=False, prefix=prefix))
+
+        # Step 2: apply the patch, this will modify the file in place
         return code_blocks

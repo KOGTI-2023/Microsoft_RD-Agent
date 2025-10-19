@@ -22,13 +22,10 @@ File structure
     - Each coder could be tested.
 """
 
-import json
 import re
 from pathlib import Path
-from typing import Dict
 
 from rdagent.app.data_science.conf import DS_RD_SETTING
-from rdagent.components.coder.CoSTEER import CoSTEER
 from rdagent.components.coder.CoSTEER.evaluators import (
     CoSTEERMultiEvaluator,
     CoSTEERSingleFeedback,
@@ -47,6 +44,7 @@ from rdagent.components.coder.data_science.raw_data_loader.eval import (
     DataLoaderCoSTEEREvaluator,
 )
 from rdagent.components.coder.data_science.raw_data_loader.exp import DataLoaderTask
+from rdagent.components.coder.data_science.share.ds_costeer import DSCoSTEER
 from rdagent.core.exception import CoderError
 from rdagent.core.experiment import FBWorkspace
 from rdagent.core.scenario import Scenario
@@ -68,7 +66,6 @@ class DataLoaderMultiProcessEvolvingStrategy(MultiProcessEvolvingStrategy):
         # return a workspace with "load_data.py", "spec/load_data.md" inside
         # assign the implemented code to the new workspace.
         competition_info = self.scen.get_scenario_all_desc(eda_output=workspace.file_dict.get("EDA.md", None))
-        runtime_environment = self.scen.get_runtime_environment()
         data_folder_info = self.scen.processed_data_folder_description
         data_loader_task_info = target_task.get_task_information()
 
@@ -96,7 +93,7 @@ class DataLoaderMultiProcessEvolvingStrategy(MultiProcessEvolvingStrategy):
         if DS_RD_SETTING.spec_enabled:
             if "spec/data_loader.md" not in workspace.file_dict:  # Only generate the spec once
                 system_prompt = T(".prompts:spec.system").r(
-                    runtime_environment=runtime_environment,
+                    runtime_environment=self.scen.get_runtime_environment(),
                     task_desc=data_loader_task_info,
                     competition_info=competition_info,
                     folder_spec=data_folder_info,
@@ -198,7 +195,7 @@ class DataLoaderMultiProcessEvolvingStrategy(MultiProcessEvolvingStrategy):
         return evo
 
 
-class DataLoaderCoSTEER(CoSTEER):
+class DataLoaderCoSTEER(DSCoSTEER):
     def __init__(
         self,
         scen: Scenario,
@@ -231,7 +228,7 @@ class DataLoaderCoSTEER(CoSTEER):
                     "scenarios.data_science.share:scen.input_path"
                 ).r()
             },
-            running_timeout_period=DS_RD_SETTING.full_timeout,
+            running_timeout_period=self.scen.real_full_timeout(),
         )
 
         stdout = new_exp.experiment_workspace.execute(env=env, entry=f"python test/data_loader_test.py")

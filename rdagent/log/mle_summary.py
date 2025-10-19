@@ -1,4 +1,5 @@
 import pickle
+import traceback
 from collections import defaultdict
 from pathlib import Path
 
@@ -16,40 +17,38 @@ from rdagent.scenarios.data_science.test_eval import (
     NoTestEvalError,
     get_test_eval,
 )
-from rdagent.scenarios.kaggle.kaggle_crawler import score_rank
+
+# from rdagent.scenarios.kaggle.kaggle_crawler import score_rank
 from rdagent.utils.workflow import LoopBase
-
-test_eval = get_test_eval()
-
-is_mle = isinstance(test_eval, MLETestEval)
 
 
 def save_grade_info(log_trace_path: Path):
+    test_eval = get_test_eval()
+
     trace_storage = FileStorage(log_trace_path)
-    for msg in trace_storage.iter_msg():
-        if "competition" in msg.tag:
-            competition = msg.content
+    for msg in trace_storage.iter_msg(tag="competition"):
+        competition = msg.content
 
-        if "running" in msg.tag:
-            if isinstance(msg.content, DSExperiment):
-                # TODO:  mle_score.txt is not a general name now.
-                # Please use a more general name like test_score.txt
-                try:
-                    mle_score_str = test_eval.eval(competition, msg.content.experiment_workspace)
-                    trace_storage.log(
-                        mle_score_str, tag=f"{msg.tag}.mle_score.pid", save_type="pkl", timestamp=msg.timestamp
-                    )
-                except Exception as e:
-                    print(f"Error in {log_trace_path}: {e}")
+    for msg in trace_storage.iter_msg(tag="running"):
+        if isinstance(msg.content, DSExperiment):
+            # TODO:  mle_score.txt is not a general name now.
+            # Please use a more general name like test_score.txt
+            try:
+                mle_score_str = test_eval.eval(competition, msg.content.experiment_workspace)
+                trace_storage.log(
+                    mle_score_str, tag=f"{msg.tag}.mle_score.pid", save_type="pkl", timestamp=msg.timestamp
+                )
+            except Exception as e:
+                print(f"Error in {log_trace_path}: {e}", traceback.format_exc())
 
 
-def save_all_grade_info(log_folder):
-    for log_trace_path in log_folder.iterdir():
+def save_all_grade_info(log_folder: str | Path) -> None:
+    for log_trace_path in Path(log_folder).iterdir():
         if is_valid_session(log_trace_path):
             try:
                 save_grade_info(log_trace_path)
             except NoTestEvalError as e:
-                print(f"Error in {log_trace_path}: {e}")
+                print(f"Error in {log_trace_path}: {e}", traceback.format_exc())
 
 
 def _get_loop_and_fn_after_hours(log_folder: Path, hours: int):
@@ -72,7 +71,10 @@ def _get_loop_and_fn_after_hours(log_folder: Path, hours: int):
     return stop_li, stop_fn
 
 
-def summarize_folder(log_folder: Path, hours: int | None = None):
+def summarize_folder(log_folder: Path, hours: int | None = None) -> None:
+    test_eval = get_test_eval()
+
+    is_mle = isinstance(test_eval, MLETestEval)
     """
     Summarize the log folder and save the summary as a pickle file.
     Args:
@@ -108,11 +110,11 @@ def summarize_folder(log_folder: Path, hours: int | None = None):
 
         if hours:
             stop_li, stop_fn = _get_loop_and_fn_after_hours(log_trace_path, hours)
-
-        for msg in FileStorage(log_trace_path).iter_msg():  # messages in log trace
-            loop_id, fn = extract_loopid_func_name(msg.tag)
+        msgs = [(msg, extract_loopid_func_name(msg.tag)) for msg in FileStorage(log_trace_path).iter_msg()]
+        msgs = [(msg, int(loop_id) if loop_id else loop_id, fn) for msg, (loop_id, fn) in msgs]
+        msgs.sort(key=lambda m: m[1] if m[1] else -1)  # sort by loop id
+        for msg, loop_id, fn in msgs:  # messages in log trace
             if loop_id:
-                loop_id = int(loop_id)
                 loop_num = max(loop_id + 1, loop_num)
             if hours and loop_id == stop_li and fn == stop_fn:
                 break
@@ -145,10 +147,10 @@ def summarize_folder(log_folder: Path, hours: int | None = None):
                                 made_submission_num += 1
                             if grade_output["score"] is not None:
                                 test_scores[loop_id] = grade_output["score"]
-                                if is_mle:
-                                    _, test_ranks[loop_id] = score_rank(
-                                        stat[log_trace_path.name]["competition"], grade_output["score"]
-                                    )
+                                # if is_mle:
+                                #     _, test_ranks[loop_id] = score_rank(
+                                #         stat[log_trace_path.name]["competition"], grade_output["score"]
+                                #     )
                             if grade_output["valid_submission"]:
                                 valid_submission_num += 1
                             if grade_output["above_median"]:
@@ -181,10 +183,10 @@ def summarize_folder(log_folder: Path, hours: int | None = None):
                                 sota_exp_stat = "made_submission"
                             if grade_output["score"] is not None:
                                 sota_exp_score = grade_output["score"]
-                                if is_mle:
-                                    _, sota_exp_rank = score_rank(
-                                        stat[log_trace_path.name]["competition"], grade_output["score"]
-                                    )
+                                # if is_mle:
+                                #     _, sota_exp_rank = score_rank(
+                                #         stat[log_trace_path.name]["competition"], grade_output["score"]
+                                #     )
 
         stat[log_trace_path.name].update(
             {
@@ -197,12 +199,12 @@ def summarize_folder(log_folder: Path, hours: int | None = None):
                 "silver_num": silver_num,
                 "gold_num": gold_num,
                 "test_scores": test_scores,
-                "test_ranks": test_ranks,
+                # "test_ranks": test_ranks,
                 "valid_scores": valid_scores,
                 "success_loop_num": success_loop_num,
                 "sota_exp_stat": sota_exp_stat,
                 "sota_exp_score": sota_exp_score,
-                "sota_exp_rank": sota_exp_rank,
+                # "sota_exp_rank": sota_exp_rank,
                 "bronze_threshold": bronze_threshold,
                 "silver_threshold": silver_threshold,
                 "gold_threshold": gold_threshold,
@@ -239,7 +241,10 @@ def summarize_folder(log_folder: Path, hours: int | None = None):
 # }
 
 
-def grade_summary(log_folder):
+def grade_summary(log_folder: str) -> None:
+    """
+    Generate test scores for log traces in the log folder and save the summary.
+    """
     log_folder = Path(log_folder)
     save_all_grade_info(log_folder)
     summarize_folder(log_folder)

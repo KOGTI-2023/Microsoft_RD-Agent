@@ -10,12 +10,14 @@ from rdagent.core.conf import ExtendedBaseSettings
 
 class LLMSettings(ExtendedBaseSettings):
     # backend
-    backend: str = "rdagent.oai.backend.DeprecBackend"
+    backend: str = "rdagent.oai.backend.LiteLLMAPIBackend"
 
     chat_model: str = "gpt-4-turbo"
     embedding_model: str = "text-embedding-3-small"
 
     reasoning_effort: Literal["low", "medium", "high"] | None = None
+    enable_response_schema: bool = True
+    # Whether to enable response_schema in chat models. may not work for models that do not support it.
 
     # Handling format
     reasoning_think_rm: bool = False
@@ -83,6 +85,7 @@ class LLMSettings(ExtendedBaseSettings):
     embedding_azure_api_base: str = ""
     embedding_azure_api_version: str = ""
     embedding_max_str_num: int = 50
+    embedding_max_length: int = 8192
 
     # offline llama2 related config
     use_llama2: bool = False

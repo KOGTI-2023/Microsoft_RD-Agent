@@ -46,13 +46,18 @@ class DataLoaderCoSTEEREvaluator(CoSTEEREvaluator):
                 final_decision=False,
             )
 
-        env = get_ds_env(extra_volumes={self.scen.debug_path: T("scenarios.data_science.share:scen.input_path").r()})
+        env = get_ds_env(
+            extra_volumes={self.scen.debug_path: T("scenarios.data_science.share:scen.input_path").r()},
+            running_timeout_period=self.scen.real_debug_timeout(),
+        )
 
         # TODO: do we need to clean the generated temporary content?
         fname = "test/data_loader_test.py"
         test_code = (DIRNAME / "eval_tests" / "data_loader_test.txt").read_text()
         implementation.inject_files(**{fname: test_code})
-        stdout, ret_code = implementation.execute_ret_code(env=env, entry=f"python {fname}")
+        result = implementation.run(env=env, entry=f"python {fname}")
+        stdout = result.get_truncated_stdout()
+        ret_code = result.exit_code
         match = re.search(r"(.*?)=== Start of EDA part ===(.*)=== End of EDA part ===(.*)", stdout, re.DOTALL)
         stdout_part_1, eda_output, stdout_part_2 = match.groups() if match else (stdout, None, "")
         stdout = stdout_part_1 + stdout_part_2

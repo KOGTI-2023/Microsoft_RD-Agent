@@ -3,6 +3,7 @@ import bisect
 import json
 import shutil
 import subprocess
+import tarfile
 import time
 import zipfile
 from itertools import chain
@@ -14,7 +15,6 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 
-from rdagent.app.kaggle.conf import KAGGLE_IMPLEMENT_SETTING
 from rdagent.core.conf import ExtendedBaseSettings
 from rdagent.core.exception import KaggleError
 from rdagent.core.utils import cache_with_pickle
@@ -107,42 +107,60 @@ def crawl_descriptions(
     return descriptions
 
 
-def download_data(
-    competition: str, settings: ExtendedBaseSettings = KAGGLE_IMPLEMENT_SETTING, enable_create_debug_data: bool = True
-) -> None:
+def download_data(competition: str, settings: ExtendedBaseSettings, enable_create_debug_data: bool = True) -> None:
     local_path = settings.local_data_path
     if settings.if_using_mle_data:
         zipfile_path = f"{local_path}/zip_files"
         zip_competition_path = Path(zipfile_path) / competition
+        competition_local_path = Path(local_path) / competition
 
         if not zip_competition_path.exists():
             mleb_env = MLEBDockerEnv()
             mleb_env.prepare()
             (Path(zipfile_path)).mkdir(parents=True, exist_ok=True)
-            mleb_env.run(
+            mleb_env.check_output(
                 f"mlebench prepare -c {competition} --data-dir ./zip_files",
                 local_path=local_path,
                 running_extra_volume={str(Path("~/.kaggle").expanduser().absolute()): "/root/.kaggle"},
             )
 
-        if not (Path(local_path) / competition).exists() or list((Path(local_path) / competition).iterdir()) == []:
-            (Path(local_path) / competition).mkdir(parents=True, exist_ok=True)
+        if not competition_local_path.exists() or list(competition_local_path.iterdir()) == []:
+            competition_local_path.mkdir(parents=True, exist_ok=True)
 
             mleb_env = MLEBDockerEnv()
             mleb_env.prepare()
-            mleb_env.run(f"cp -r ./zip_files/{competition}/prepared/public/* ./{competition}", local_path=local_path)
+            mleb_env.check_output(
+                f"cp -r ./zip_files/{competition}/prepared/public/* ./{competition}", local_path=local_path
+            )
 
-            for zip_path in (Path(local_path) / competition).rglob("*.zip"):
+            for zip_path in competition_local_path.rglob("*.zip"):
                 with zipfile.ZipFile(zip_path, "r") as zip_ref:
                     if len(zip_ref.namelist()) == 1:
-                        mleb_env.run(
-                            f"unzip -o ./{zip_path.relative_to(local_path)} -d {zip_path.parent.relative_to(local_path)}",
-                            local_path=local_path,
+                        mleb_env.check_output(
+                            f"unzip -o ./{zip_path.relative_to(competition_local_path)} -d {zip_path.parent.relative_to(competition_local_path)}",
+                            local_path=competition_local_path,
                         )
                     else:
-                        mleb_env.run(
-                            f"mkdir -p ./{zip_path.parent.relative_to(local_path)}/{zip_path.stem}; unzip -o ./{zip_path.relative_to(local_path)} -d ./{zip_path.parent.relative_to(local_path)}/{zip_path.stem}",
-                            local_path=local_path,
+                        mleb_env.check_output(
+                            f"mkdir -p ./{zip_path.parent.relative_to(competition_local_path)}/{zip_path.stem}; unzip -o ./{zip_path.relative_to(competition_local_path)} -d ./{zip_path.parent.relative_to(competition_local_path)}/{zip_path.stem}",
+                            local_path=competition_local_path,
+                        )
+            for tar_path in competition_local_path.rglob("*.tar*"):
+                if not tarfile.is_tarfile(tar_path):
+                    logger.error(f"{tar_path} is not a valid tar file.")
+                    continue
+                is_gzip_file = open(tar_path, "rb").read(2) == b"\x1f\x8b"
+                with tarfile.open(tar_path, "r:gz") if is_gzip_file else tarfile.open(tar_path, "r") as tar_ref:
+                    if len(tar_ref.getmembers()) == 1:
+                        mleb_env.check_output(
+                            f"tar -{'xzf' if is_gzip_file else 'xf'} ./{tar_path.relative_to(competition_local_path)} -C {tar_path.parent.relative_to(competition_local_path)}",
+                            local_path=competition_local_path,
+                        )
+                    else:
+                        folder_name = tar_path.name.replace(".tar", "").replace(".gz", "")
+                        mleb_env.check_output(
+                            f"mkdir -p ./{tar_path.parent.relative_to(competition_local_path)}/{folder_name}; tar -{'xzf' if is_gzip_file else 'xf'} ./{tar_path.relative_to(competition_local_path)} -C ./{tar_path.parent.relative_to(competition_local_path)}/{folder_name}",
+                            local_path=competition_local_path,
                         )
             # NOTE:
             # Patching:  due to mle has special renaming mechanism for different competition;
@@ -193,18 +211,24 @@ def leaderboard_scores(competition: str) -> list[float]:
 
     api = KaggleApi()
     api.authenticate()
-    ll = api.competition_leaderboard_view(competition)
-    return [float(x.score) for x in ll]
+
+    return [i.score for i in api.competition_leaderboard_view(competition)]
 
 
 def get_metric_direction(competition: str) -> bool:
     """
     Return **True** if the metric is *bigger is better*, **False** if *smaller is better*.
     """
+    if competition == "aerial-cactus-identification":
+        return True
+    if competition == "leaf-classification":
+        return False
     leaderboard = leaderboard_scores(competition)
+
     return float(leaderboard[0]) > float(leaderboard[-1])
 
 
+# FIXME: current score_rank is incorrect because kaggle api returns only the first page leaderboard
 def score_rank(competition: str, score: float) -> tuple[int, float]:
     """
     Return
@@ -225,9 +249,7 @@ def score_rank(competition: str, score: float) -> tuple[int, float]:
     return rank, rank_percent
 
 
-def download_notebooks(
-    competition: str, local_path: str = f"{KAGGLE_IMPLEMENT_SETTING.local_data_path}/notebooks", num: int = 15
-) -> None:
+def download_notebooks(competition: str, local_path: str, num: int = 15) -> None:
     data_path = Path(f"{local_path}/{competition}")
     from kaggle.api.kaggle_api_extended import KaggleApi
 
@@ -262,9 +284,7 @@ def notebook_to_knowledge(notebook_text: str) -> str:
     return response
 
 
-def convert_notebooks_to_text(
-    competition: str, local_path: str = f"{KAGGLE_IMPLEMENT_SETTING.local_data_path}/notebooks"
-) -> None:
+def convert_notebooks_to_text(competition: str, local_path: str) -> None:
     data_path = Path(f"{local_path}/{competition}")
     converted_num = 0
 
@@ -300,7 +320,7 @@ def convert_notebooks_to_text(
     print(f"Converted {converted_num} notebooks to text files.")
 
 
-def collect_knowledge_texts(local_path: str = KAGGLE_IMPLEMENT_SETTING.local_data_path) -> dict[str, list[str]]:
+def collect_knowledge_texts(notebooks_path: str | Path) -> dict[str, list[str]]:
     """
     {
         "competition1": [
@@ -316,7 +336,7 @@ def collect_knowledge_texts(local_path: str = KAGGLE_IMPLEMENT_SETTING.local_dat
         ...
     }
     """
-    notebooks_dir = Path(local_path) / "notebooks"
+    notebooks_dir = Path(notebooks_path)
 
     competition_knowledge_texts_dict = {}
     for competition_dir in notebooks_dir.iterdir():

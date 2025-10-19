@@ -6,20 +6,29 @@ from typing import Dict, Tuple
 
 from rdagent.app.data_science.conf import DS_RD_SETTING
 from rdagent.components.coder.data_science.pipeline.exp import PipelineTask
-from rdagent.core.proposal import ExpGen
+from rdagent.core.proposal import ExperimentFeedback, ExpGen
 from rdagent.log import rdagent_logger as logger
 from rdagent.log.timer import RD_Agent_TIMER_wrapper, RDAgentTimer
 from rdagent.oai.llm_utils import APIBackend
 from rdagent.scenarios.data_science.experiment.experiment import DSExperiment
 from rdagent.scenarios.data_science.loop import DataScienceRDLoop
 from rdagent.scenarios.data_science.proposal.exp_gen.base import DSHypothesis, DSTrace
+from rdagent.scenarios.data_science.proposal.exp_gen.planner import DSExperimentPlan
 from rdagent.scenarios.data_science.proposal.exp_gen.proposal import DSProposalV2ExpGen
 from rdagent.utils.agent.tpl import T
 from rdagent.utils.workflow import wait_retry
 
+from .proposal import (
+    HypothesisComponent,  # FIXME: for statistic of other branches after running, remove this later
+)
+
 
 class MergeExpGen(ExpGen):
-    def gen(self, trace: DSTrace) -> DSExperiment:
+    def gen(
+        self,
+        trace: DSTrace,
+        plan: DSExperimentPlan | None = None,
+    ) -> DSExperiment:
         # Ignore the selection argument and use all leaves instead.
         leaves: list[int] = trace.get_leaves()
         trace.set_current_selection((leaves[0],))  # override the current selection.
@@ -119,15 +128,30 @@ class ExpGen2Hypothesis(DSProposalV2ExpGen):
         resp_dict = json.loads(response)
         return resp_dict
 
-    def gen(self, trace: DSTrace) -> DSExperiment:
-        # Ignore the selection argument and use all leaves instead.
+    def get_exp_index(self, trace: DSTrace) -> int:
         leaves: list[int] = trace.get_leaves()
-        sota_exp_fb = trace.sota_experiment_fb(selection=trace.current_selection)
-        exp_index = leaves[1] if trace.current_selection[0] == leaves[0] else leaves[0]
+        if trace.sota_exp_to_submit is not None:
+            sota_submit_value = trace.sota_exp_to_submit.result.loc["ensemble"].iloc[0]
+            trace_scores = []
+            for i, leaf in enumerate(leaves):
+                if leaf == trace.current_selection[0]:
+                    continue
+                fb = trace.sota_experiment_fb(selection=(leaf,))
+                if fb is None:
+                    continue
+                final_score = fb[0].result.loc["ensemble"].iloc[0]
+                trace_scores.append((i, abs(final_score - sota_submit_value)))
+            if trace_scores:
+                return min(trace_scores, key=lambda item: item[1])[0]
+        return next((i for i, leaf in enumerate(leaves) if leaf != trace.current_selection[0]))
 
-        exp_to_merge_fb = trace.sota_experiment_fb(selection=(exp_index,))
-        if exp_to_merge_fb is None:
-            exp_to_merge_fb = trace.hist[exp_index]
+    def gen(
+        self,
+        trace: DSTrace,
+        plan: DSExperimentPlan | None = None,
+    ) -> DSExperiment:
+        # Ignore the selection argument and use all leaves instead.
+        sota_exp_fb = trace.sota_experiment_fb(selection=trace.current_selection)
 
         if sota_exp_fb:
             sota_exp_desc = T("scenarios.data_science.share:describe.exp").r(
@@ -139,9 +163,28 @@ class ExpGen2Hypothesis(DSProposalV2ExpGen):
             sota_exp_desc = ""
             eda_output = None
 
-        success_fb_list = trace.experiment_and_feedback_list_after_init(
-            return_type="sota", search_type="ancestors", selection=(exp_index,)
+        trace_fbs: list[tuple[DSExperiment, ExperimentFeedback]] = []
+        # find the best exp to merge
+        leaves: list[int] = trace.get_leaves()
+        max_sota_retrieved_num_per_trace = max(DS_RD_SETTING.max_sota_retrieved_num * 2 // len(leaves), 4)
+        for leaf in leaves:
+            if leaf == trace.current_selection[0]:
+                continue
+
+            trace_fbs.extend(
+                trace.experiment_and_feedback_list_after_init(
+                    return_type="sota",
+                    search_type="ancestors",
+                    selection=(leaf,),
+                    max_retrieve_num=max_sota_retrieved_num_per_trace,
+                )
+            )
+
+        success_fb_list = list(set(trace_fbs))
+        logger.info(
+            f"Merge Hypothesis: select {len(success_fb_list)} from {len(trace_fbs)} SOTA experiments found in {len(leaves)} traces"
         )
+
         if len(success_fb_list) > 0:
             exp_to_merge_fb_desc = T("scenarios.data_science.proposal.exp_gen.merge:trace").r(
                 exp_and_feedback_list=success_fb_list,
@@ -151,6 +194,11 @@ class ExpGen2Hypothesis(DSProposalV2ExpGen):
                 pipeline=DS_RD_SETTING.coder_on_whole_pipeline,
             )
         else:
+            exp_index = self.get_exp_index(trace)
+            exp_to_merge_fb = trace.sota_experiment_fb(selection=(exp_index,))
+            if exp_to_merge_fb is None:
+                exp_to_merge_fb = trace.hist[exp_index]
+
             exp_to_merge_fb_desc = T("scenarios.data_science.share:describe.feedback").r(
                 exp_and_feedback=exp_to_merge_fb,
                 heading="The feedback for the solution to be merged",
@@ -181,25 +229,29 @@ class ExpGen2Hypothesis(DSProposalV2ExpGen):
             scenario_desc=scenario_desc,
             sota_exp_desc=sota_exp_desc,
             sota_exp=sota_exp_fb[0] if sota_exp_fb else None,
-            hypothesis=new_hypothesis,
+            hypotheses=[new_hypothesis],
+            hypotheses_candidates=[new_hypothesis],
             pipeline=DS_RD_SETTING.coder_on_whole_pipeline,
             failed_exp_feedback_list_desc="",
         )
 
 
 class ExpGen2TraceAndMerge(ExpGen):
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.merge_exp_gen = MergeExpGen(self.scen)
-        self.exp_gen = DataScienceRDLoop._get_exp_gen(
-            "rdagent.scenarios.data_science.proposal.exp_gen.DSExpGen", self.scen
-        )
+        self.exp_gen = DataScienceRDLoop.default_exp_gen(self.scen)
 
-    def gen(self, trace: DSTrace) -> DSExperiment:
+    def gen(
+        self,
+        trace: DSTrace,
+        plan: DSExperimentPlan | None = None,
+    ) -> DSExperiment:
         timer: RDAgentTimer = RD_Agent_TIMER_wrapper.timer
-        logger.info(f"Remain time: {timer.remain_time_duration}")
+        logger.info(f"Remain time: {timer.remain_time()}")
 
-        if timer.remain_time_duration >= timedelta(hours=DS_RD_SETTING.merge_hours):
+        if timer.remain_time() >= timedelta(hours=DS_RD_SETTING.merge_hours):
             leaves: list[int] = trace.get_leaves()
             if len(leaves) < 2:
                 selection = trace.NEW_ROOT  # create new trace
@@ -221,7 +273,11 @@ class ExpGen2TraceAndMerge(ExpGen):
 
 
 class MergeExpGen_MultiTrace(ExpGen):
-    def gen(self, trace: DSTrace) -> DSExperiment:
+    def gen(
+        self,
+        trace: DSTrace,
+        plan: DSExperimentPlan | None = None,
+    ) -> DSExperiment:
         # Ignore the selection argument and use all leaves instead.
         leaves: list[int] = trace.get_leaves()
 
@@ -299,26 +355,40 @@ class ExpGen2TraceAndMergeV2(ExpGen):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.merge_exp_gen = MergeExpGen_MultiTrace(self.scen)
-        self.exp_gen = DataScienceRDLoop._get_exp_gen(
-            "rdagent.scenarios.data_science.proposal.exp_gen.DSExpGen", self.scen
-        )
+        self.exp_gen = DataScienceRDLoop.default_exp_gen(self.scen)
         self.flag_start_merge = False
 
-    def gen(self, trace: DSTrace) -> DSExperiment:
+    def reset_exp_gen_version(self, version: str = "v2"):
+        # AFAIK, this class is not used anymore (because v3 & v1 is deprecated); So we just leave a NotImplementedError instead of refine it.
+        # DS_RD_SETTING.proposal_version = version
+        # logger.info(f"ExpGen2TraceAndMergeV2: Resetting proposal version to {version}")
+        # self.exp_gen = DataScienceRDLoop._get_exp_gen(
+        #     f"rdagent.scenarios.data_science.proposal.exp_gen.DSExpGen", self.scen
+        # )
+        raise NotImplementedError("You should not switch version with proposal_version")
+
+    def gen(
+        self, trace: DSTrace, plan: DSExperimentPlan | None = None, selection: tuple[int, ...] = (-1,)
+    ) -> DSExperiment:
         timer: RDAgentTimer = RD_Agent_TIMER_wrapper.timer
-        logger.info(f"Remain time: {timer.remain_time_duration}")
+        logger.info(f"Remain time: {timer.remain_time()}")
 
-        if timer.remain_time_duration >= timedelta(hours=DS_RD_SETTING.merge_hours):
-
-            if DS_RD_SETTING.enable_inject_knowledge_at_root:
+        if timer.remain_time() >= timedelta(hours=DS_RD_SETTING.merge_hours):
+            if DS_RD_SETTING.enable_multi_version_exp_gen:
+                exp_gen_version_list = DS_RD_SETTING.exp_gen_version_list.split(",")
+                for version in exp_gen_version_list:
+                    assert version in ["v3", "v2", "v1"]
 
                 if len(trace.hist) == 0:
-                    # set the knowledge base option to True for the first trace
-                    DS_RD_SETTING.enable_knowledge_base = True
+                    # set the proposal version for the first sub-trace
+                    self.reset_exp_gen_version(version=exp_gen_version_list[0])
+                elif len(trace.get_current_selection()) == 0 and trace.sub_trace_count > 0:
+                    # reset the proposal version at the start of other sub-trace
+                    if trace.sub_trace_count - 1 < len(exp_gen_version_list):
+                        self.reset_exp_gen_version(version=exp_gen_version_list[trace.sub_trace_count - 1])
+                    else:
+                        self.reset_exp_gen_version(version=exp_gen_version_list[-1])
 
-                else:
-                    # set the knowledge base option back to False for the other traces
-                    DS_RD_SETTING.enable_knowledge_base = False
             return self.exp_gen.gen(trace)
 
         else:
@@ -345,25 +415,17 @@ class ExpGen2TraceAndMergeV3(ExpGen):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.merge_exp_gen = ExpGen2Hypothesis(self.scen)
-        self.exp_gen = DataScienceRDLoop._get_exp_gen(
-            "rdagent.scenarios.data_science.proposal.exp_gen.DSExpGen", self.scen
-        )
+        self.exp_gen = DataScienceRDLoop.default_exp_gen(self.scen)
 
-    def gen(self, trace: DSTrace) -> DSExperiment:
+    def gen(
+        self,
+        trace: DSTrace,
+        plan: DSExperimentPlan | None = None,
+    ) -> DSExperiment:
         timer: RDAgentTimer = RD_Agent_TIMER_wrapper.timer
-        logger.info(f"Remain time: {timer.remain_time_duration}")
+        logger.info(f"Remain time: {timer.remain_time()}")
 
-        if timer.remain_time_duration >= timedelta(hours=DS_RD_SETTING.merge_hours):
-
-            if DS_RD_SETTING.enable_inject_knowledge_at_root:
-
-                if len(trace.hist) == 0:
-                    # set the knowledge base option to True for the first trace
-                    DS_RD_SETTING.enable_knowledge_base = True
-
-                else:
-                    # set the knowledge base option back to False for the other traces
-                    DS_RD_SETTING.enable_knowledge_base = False
+        if timer.remain_time() >= timedelta(hours=DS_RD_SETTING.merge_hours):
             return self.exp_gen.gen(trace)
         else:
             # disable reset in merging stage
@@ -377,7 +439,9 @@ class ExpGen2TraceAndMergeV3(ExpGen):
             else:
                 selection = (leaves[0],)
                 if trace.sota_exp_to_submit is not None:
-                    if trace.is_parent(trace.exp2idx(trace.sota_exp_to_submit), leaves[1]):
-                        selection = (leaves[1],)
+                    for i in range(1, len(leaves)):
+                        if trace.is_parent(trace.exp2idx(trace.sota_exp_to_submit), leaves[i]):
+                            selection = (leaves[i],)
+                            break
                 trace.set_current_selection(selection)
                 return self.merge_exp_gen.gen(trace)

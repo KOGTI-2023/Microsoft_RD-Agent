@@ -3,6 +3,7 @@ from typing import Tuple
 
 from rdagent.core.experiment import Experiment
 from rdagent.core.proposal import (
+    ExperimentPlan,
     Hypothesis,
     Hypothesis2Experiment,
     HypothesisGen,
@@ -11,6 +12,7 @@ from rdagent.core.proposal import (
 )
 from rdagent.oai.llm_utils import APIBackend
 from rdagent.utils.agent.tpl import T
+from rdagent.utils.workflow import wait_retry
 
 
 class LLMHypothesisGen(HypothesisGen):
@@ -24,7 +26,11 @@ class LLMHypothesisGen(HypothesisGen):
     @abstractmethod
     def convert_response(self, response: str) -> Hypothesis: ...
 
-    def gen(self, trace: Trace) -> Hypothesis:
+    def gen(
+        self,
+        trace: Trace,
+        plan: ExperimentPlan | None = None,
+    ) -> Hypothesis:
         context_dict, json_flag = self.prepare_context(trace)
 
         system_prompt = T(".prompts:hypothesis_gen.system_prompt").r(
@@ -83,6 +89,7 @@ class LLMHypothesis2Experiment(Hypothesis2Experiment[Experiment]):
     @abstractmethod
     def convert_response(self, response: str, hypothesis: Hypothesis, trace: Trace) -> Experiment: ...
 
+    @wait_retry(retry_n=5)
     def convert(self, hypothesis: Hypothesis, trace: Trace) -> Experiment:
         context, json_flag = self.prepare_context(hypothesis, trace)
         system_prompt = T(".prompts:hypothesis2experiment.system_prompt").r(

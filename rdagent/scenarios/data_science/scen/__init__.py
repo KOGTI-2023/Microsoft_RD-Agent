@@ -1,4 +1,5 @@
 import json
+import runpy
 from pathlib import Path
 from typing import Dict
 
@@ -7,16 +8,18 @@ from rdagent.components.coder.data_science.conf import get_ds_env
 from rdagent.core.experiment import FBWorkspace
 from rdagent.core.scenario import Scenario
 from rdagent.log import rdagent_logger as logger
+from rdagent.log.timer import RD_Agent_TIMER_wrapper
 from rdagent.oai.llm_utils import APIBackend
 from rdagent.scenarios.data_science.debug.data import create_debug_data
-from rdagent.scenarios.data_science.scen.utils import (
-    describe_data_folder,
-    describe_data_folder_v2,
-)
+from rdagent.scenarios.data_science.scen.utils import describe_data_folder_v2
 from rdagent.scenarios.kaggle.kaggle_crawler import (
     crawl_descriptions,
     download_data,
     get_metric_direction,
+)
+from rdagent.scenarios.shared.get_runtime_info import (
+    check_runtime_environment,
+    get_runtime_environment_by_env,
 )
 from rdagent.utils.agent.tpl import T
 
@@ -26,16 +29,27 @@ class DataScienceScen(Scenario):
 
     def __init__(self, competition: str) -> None:
 
+        check_runtime_environment(get_ds_env())
         # 1) prepare data
         if not Path(f"{DS_RD_SETTING.local_data_path}/{competition}").exists():
             logger.error(f"Please prepare data for competition {competition} first.")
             raise FileNotFoundError(f"Cannot find {competition} in {DS_RD_SETTING.local_data_path}")
 
         local_path = DS_RD_SETTING.local_data_path
-        if DS_RD_SETTING.sample_data:
+        if not DS_RD_SETTING.sample_data_by_LLM:
             self.debug_path = f"{local_path}/sample/{competition}"
             if not Path(self.debug_path).exists():
-                create_debug_data(competition, dataset_path=local_path)
+                sample_py_path = Path(local_path) / competition / "sample.py"
+                if sample_py_path.exists():
+                    runpy.run_path(
+                        str(sample_py_path),
+                        init_globals={
+                            "dataset_path": str(local_path),
+                            "output_path": str(self.debug_path),
+                        },
+                    )
+                else:
+                    create_debug_data(competition, dataset_path=local_path)
         else:
             self.debug_path = f"{local_path}/{competition}"
 
@@ -51,6 +65,7 @@ class DataScienceScen(Scenario):
         self.metric_direction: bool = (
             self._get_direction()
         )  # True indicates higher is better, False indicates lower is better
+        self.timeout_increase_count = 0
 
     def reanalyze_competition_description(self):
         self.raw_description = self._get_description()
@@ -102,6 +117,68 @@ class DataScienceScen(Scenario):
         )
         self.metric_name = response_json_analysis.get("Metric Name", "custom_metric")
         self.metric_direction_guess = response_json_analysis.get("Metric Direction", True)
+        # Determine if longer timeout is needed for coder and runner separately
+        base_longer_timeout_needed = (
+            False
+            if not DS_RD_SETTING.allow_longer_timeout
+            else response_json_analysis.get("Longer time limit required", False)
+        )
+
+        self.coder_longer_time_limit_required = (
+            base_longer_timeout_needed
+            if DS_RD_SETTING.coder_enable_llm_decide_longer_timeout
+            else DS_RD_SETTING.allow_longer_timeout
+        )
+
+        self.runner_longer_time_limit_required = (
+            base_longer_timeout_needed
+            if DS_RD_SETTING.runner_enable_llm_decide_longer_timeout
+            else DS_RD_SETTING.allow_longer_timeout
+        )
+
+        # True or False, whether the competition scenario requires a longer time limit to the code.
+
+    def real_debug_timeout(self):
+        return (
+            DS_RD_SETTING.debug_timeout
+            * min(
+                DS_RD_SETTING.coder_longer_timeout_multiplier_upper,
+                self.timeout_increase_count * DS_RD_SETTING.coder_timeout_increase_stage + 1,
+            )
+            if self.coder_longer_time_limit_required
+            else DS_RD_SETTING.debug_timeout
+        )
+
+    def recommend_debug_timeout(self):
+        return DS_RD_SETTING.debug_recommend_timeout
+
+    def real_full_timeout(self):
+        if DS_RD_SETTING.ensemble_time_upper_bound:
+            remain_time = RD_Agent_TIMER_wrapper.timer.remain_time()
+            all_duration = RD_Agent_TIMER_wrapper.timer.all_duration
+            remain_percent = remain_time / all_duration
+            if remain_percent * 100 < 100 - DS_RD_SETTING.ratio_merge_or_ensemble:
+                return DS_RD_SETTING.full_timeout * DS_RD_SETTING.runner_longer_timeout_multiplier_upper
+
+        return (
+            DS_RD_SETTING.full_timeout
+            * min(
+                DS_RD_SETTING.runner_longer_timeout_multiplier_upper,
+                self.timeout_increase_count
+                // DS_RD_SETTING.runner_timeout_increase_stage_patience
+                * DS_RD_SETTING.runner_timeout_increase_stage
+                + 1,
+            )
+            if self.runner_longer_time_limit_required
+            else DS_RD_SETTING.full_timeout
+        )
+
+    def recommend_full_timeout(self):
+        return DS_RD_SETTING.full_recommend_timeout
+
+    def increase_timeout(self):
+        """Increase the timeout multiplier for the scenario."""
+        self.timeout_increase_count += 1
 
     @property
     def background(self) -> str:
@@ -133,7 +210,11 @@ class DataScienceScen(Scenario):
             raw_description=self.raw_description,
             use_raw_description=DS_RD_SETTING.use_raw_description,
             time_limit=None,
+            recommend_time_limit=None,
             eda_output=None,
+            debug_time_limit=None,
+            recommend_debug_time_limit=None,
+            runtime_environment=self.get_runtime_environment(),
         )
 
     def get_scenario_all_desc(self, eda_output=None) -> str:
@@ -148,19 +229,25 @@ class DataScienceScen(Scenario):
             metric_direction=self.metric_direction,
             raw_description=self.raw_description,
             use_raw_description=DS_RD_SETTING.use_raw_description,
-            time_limit=f"{DS_RD_SETTING.full_timeout / 60 / 60 : .2f} hours",
+            time_limit=f"{self.real_full_timeout() / 60 / 60 : .2f} hours" if DS_RD_SETTING.show_hard_limit else None,
+            recommend_time_limit=(
+                f"{self.recommend_full_timeout() / 60 / 60 : .2f} hours" if DS_RD_SETTING.sample_data_by_LLM else None
+            ),
             eda_output=eda_output,
+            debug_time_limit=(
+                f"{self.real_debug_timeout() / 60 : .2f} minutes" if DS_RD_SETTING.show_hard_limit else None
+            ),
+            recommend_debug_time_limit=(
+                f"{self.recommend_debug_timeout() / 60 : .2f} minutes" if DS_RD_SETTING.sample_data_by_LLM else None
+            ),
+            runtime_environment=self.get_runtime_environment(),
         )
 
     def get_runtime_environment(self) -> str:
         # TODO:  add it into base class.  Environment should(i.e. `DSDockerConf`) should be part of the scenario class.
-        env = get_ds_env()
-        implementation = FBWorkspace()
-        fname = "temp.py"
-        implementation.inject_files(
-            **{fname: (Path(__file__).absolute().resolve().parent / "runtime_info.py").read_text()}
-        )
-        stdout = implementation.execute(env=env, entry=f"python {fname}")
+        """Return runtime environment information."""
+        ds_env = get_ds_env()
+        stdout = get_runtime_environment_by_env(env=ds_env)
         return stdout
 
     def _get_data_folder_description(self) -> str:

@@ -13,29 +13,77 @@ Installation
 **Install Docker**: RDAgent is designed for research and development, acting like a human researcher and developer. It can write and run code in various environments, primarily using Docker for code execution. This keeps the remaining dependencies simple. Users must ensure Docker is installed before attempting most scenarios. Please refer to the `official 🐳Docker page <https://docs.docker.com/engine/install/>`_ for installation instructions.
 Ensure the current user can run Docker commands **without using sudo**. You can verify this by executing `docker run hello-world`.
 
-LiteLLM Backend Configuration
-=============================
+LiteLLM Backend Configuration (Default)
+=======================================
 
-Please create a `.env` file in the root directory of the project and add environment variables.
+.. note::
+   🔥 **Attention**: We now provide experimental support for **DeepSeek** models! You can use DeepSeek's official API for cost-effective and high-performance inference. See the configuration example below for DeepSeek setup.
 
-Here is a sample configuration for using OpenAI's gpt-4o via LiteLLM. 
+Option 1: Unified API base for both models
+------------------------------------------
 
    .. code-block:: Properties
 
-      BACKEND=rdagent.oai.backend.LiteLLMAPIBackend
-      # It can be modified to any model supported by LiteLLM.
-      CHAT_MODEL=gpt-4o
+      # Set to any model supported by LiteLLM.
+      CHAT_MODEL=gpt-4o 
       EMBEDDING_MODEL=text-embedding-3-small
+      # Configure unified API base
       # The backend api_key fully follows the convention of litellm.
+      OPENAI_API_BASE=<your_unified_api_base>
       OPENAI_API_KEY=<replace_with_your_openai_api_key>
+
+Option 2: Separate API bases for Chat and Embedding models
+----------------------------------------------------------
+
+   .. code-block:: Properties
+
+      # Set to any model supported by LiteLLM.
+      
+      # CHAT MODEL:
+      CHAT_MODEL=gpt-4o 
+      OPENAI_API_BASE=<your_chat_api_base>
+      OPENAI_API_KEY=<replace_with_your_openai_api_key>
+
+      # EMBEDDING MODEL:
+      # TAKE siliconflow as an example, you can use other providers.
+      # Note: embedding requires litellm_proxy prefix
+      EMBEDDING_MODEL=litellm_proxy/BAAI/bge-large-en-v1.5
+      LITELLM_PROXY_API_KEY=<replace_with_your_siliconflow_api_key>
+      LITELLM_PROXY_API_BASE=https://api.siliconflow.cn/v1
+
+Configuration Example: DeepSeek Setup
+-------------------------------------
+
+Many users encounter configuration errors when setting up DeepSeek. Here's a complete working example:
+
+   .. code-block:: Properties
+
+      # CHAT MODEL: Using DeepSeek Official API
+      CHAT_MODEL=deepseek/deepseek-chat 
+      DEEPSEEK_API_KEY=<replace_with_your_deepseek_api_key>
+
+      # EMBEDDING MODEL: Using SiliconFlow for embedding since DeepSeek has no embedding model.
+      # Note: embedding requires litellm_proxy prefix
+      EMBEDDING_MODEL=litellm_proxy/BAAI/bge-m3
+      LITELLM_PROXY_API_KEY=<replace_with_your_siliconflow_api_key>
+      LITELLM_PROXY_API_BASE=https://api.siliconflow.cn/v1
 
 Necessary parameters include:
 
-- `BACKEND`: The backend to use. The default is `rdagent.oai.backend.DeprecBackend`. To use the LiteLLM backend, set it to `rdagent.oai.backend.LiteLLMAPIBackend`.
-
-- `CHAT_MODEL`: The model name of the chat model. 
+- `CHAT_MODEL`: The model name of the chat model.
 
 - `EMBEDDING_MODEL`: The model name of the embedding model.
+
+- `OPENAI_API_BASE`: The base URL of the API. If `EMBEDDING_MODEL` does not start with `litellm_proxy/`, this is used for both chat and embedding models; otherwise, it is used for `CHAT_MODEL` only.
+
+Optional parameters (required if your embedding model is provided by a different provider than `CHAT_MODEL`):
+
+- `LITELLM_PROXY_API_KEY`: The API key for the embedding model, required if `EMBEDDING_MODEL` starts with `litellm_proxy/`.
+
+- `LITELLM_PROXY_API_BASE`: The base URL for the embedding model, required if `EMBEDDING_MODEL` starts with `litellm_proxy/`.
+
+**Note:** If you are using an embedding model from a provider different from the chat model, remember to add the `litellm_proxy/` prefix to the `EMBEDDING_MODEL` name.
+
 
 The `CHAT_MODEL` and `EMBEDDING_MODEL` parameters will be passed into LiteLLM's completion function. 
 
@@ -51,15 +99,76 @@ For example, if you are using a DeepSeek model, you need to set as follows:
       CHAT_MODEL=deepseek/deepseek-chat
       DEEPSEEK_API_KEY=<replace_with_your_deepseek_api_key>
 
+Besides, when you are using reasoning models, the response might include the thought process. For this case, you need to set the following environment variable:
+   
+   .. code-block:: Properties
+      
+      REASONING_THINK_RM=True
+
 For more details on LiteLLM requirements, refer to the `official LiteLLM documentation <https://docs.litellm.ai/docs>`_.
 
+Configuration Example 2: Azure OpenAI Setup
+-------------------------------------------
+Here’s a sample configuration specifically for Azure OpenAI, based on the `official LiteLLM documentation <https://docs.litellm.ai/docs>`_:
+
+If you're using Azure OpenAI, below is a working example using the Python SDK, following the `LiteLLM Azure OpenAI documentation <https://docs.litellm.ai/docs/providers/azure/>`_:
+
+   .. code-block:: Properties
+
+      from litellm import completion
+      import os
+      
+      # Set Azure OpenAI environment variables
+      os.environ["AZURE_API_KEY"] = "<your_azure_api_key>"
+      os.environ["AZURE_API_BASE"] = "<your_azure_api_base>"
+      os.environ["AZURE_API_VERSION"] = "<version>"
+      
+      # Make a request to your Azure deployment
+      response = completion(
+        "azure/<your_deployment_name>",
+        messages = [{ "content": "Hello, how are you?", "role": "user" }]
+      )
+
+To align with the Python SDK example above, you can configure the `CHAT_MODEL` based on the `response` model setting and use the corresponding `os.environ` variables by writing them into your local `.env` file as follows:
+
+   .. code-block:: Properties
+
+      cat << EOF > .env
+      # CHAT MODEL: Azure OpenAI via LiteLLM
+      CHAT_MODEL=azure/<your_deployment_name>
+      AZURE_API_BASE=https://<your_azure_base>.openai.azure.com/
+      AZURE_API_KEY=<your_azure_api_key>
+      AZURE_API_VERSION=<version>
+      
+      # EMBEDDING MODEL: Using SiliconFlow via litellm_proxy
+      EMBEDDING_MODEL=litellm_proxy/BAAI/bge-large-en-v1.5
+      LITELLM_PROXY_API_KEY=<your_siliconflow_api_key>
+      LITELLM_PROXY_API_BASE=https://api.siliconflow.cn/v1
+      EOF
+
+This configuration allows you to call Azure OpenAI through LiteLLM while using an external provider (e.g., SiliconFlow) for embeddings.
+
+If your `Azure OpenAI API Key`` supports `embedding model`, you can refer to the following configuration example.
+
+   .. code-block:: Properties
+
+      cat << EOF  > .env
+      EMBEDDING_MODEL=azure/<Model deployment supporting embedding>
+      CHAT_MODEL=azure/<your deployment name>
+      AZURE_API_KEY=<replace_with_your_openai_api_key>
+      AZURE_API_BASE=<your_unified_api_base>
+      AZURE_API_VERSION=<azure api version>
 
 Configuration(deprecated)
 =========================
 
 To run the application, please create a `.env` file in the root directory of the project and add environment variables according to your requirements.
 
-The standard configuration options for the user using the OpenAI API are provided in the `.env.example` file.
+If you are using this deprecated version,  you should set `BACKEND` to `rdagent.oai.backend.DeprecBackend`.
+
+   .. code-block:: Properties
+
+      BACKEND=rdagent.oai.backend.DeprecBackend
 
 Here are some other configuration options that you can use:
 

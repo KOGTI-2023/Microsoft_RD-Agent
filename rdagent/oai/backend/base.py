@@ -1,18 +1,20 @@
 from __future__ import annotations
 
+import io
 import json
 import re
 import sqlite3
 import time
+import tokenize
 import uuid
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Any, Callable, List, Optional, Tuple, Type, Union, cast
 
 import pytz
-from pydantic import TypeAdapter
+from pydantic import BaseModel, TypeAdapter
 
 from rdagent.core.exception import PolicyError
 from rdagent.core.utils import LLM_CACHE_SEED_GEN, SingletonBaseClass
@@ -20,6 +22,7 @@ from rdagent.log import LogColors
 from rdagent.log import rdagent_logger as logger
 from rdagent.log.timer import RD_Agent_TIMER_wrapper
 from rdagent.oai.llm_conf import LLM_SETTINGS
+from rdagent.oai.utils.embedding import truncate_content_list
 from rdagent.utils import md5_hash
 
 try:
@@ -29,6 +32,108 @@ try:
     openai_imported = True
 except ImportError:
     openai_imported = False
+
+
+class JSONParser:
+    """JSON parser supporting multiple strategies"""
+
+    def __init__(self, add_json_in_prompt: bool = False) -> None:
+        self.strategies: List[Callable[[str], str]] = [
+            self._direct_parse,
+            self._extract_from_code_block,
+            self._fix_python_syntax,
+            self._extract_with_fix_combined,
+        ]
+        self.add_json_in_prompt = add_json_in_prompt
+
+    def parse(self, content: str) -> str:
+        """Parse JSON content, automatically trying multiple strategies"""
+        original_content = content
+
+        for strategy in self.strategies:
+            try:
+                return strategy(original_content)
+            except json.JSONDecodeError:
+                continue
+
+        # All strategies failed
+        if not self.add_json_in_prompt:
+            error = json.JSONDecodeError(
+                "Failed to parse JSON after all attempts, maybe because 'messages' must contain the word 'json' in some form",
+                original_content,
+                0,
+            )
+            error.message = "Failed to parse JSON after all attempts, maybe because 'messages' must contain the word 'json' in some form"  # type: ignore[attr-defined]
+            raise error
+        else:
+            raise json.JSONDecodeError("Failed to parse JSON after all attempts", original_content, 0)
+
+    def _direct_parse(self, content: str) -> str:
+        """Strategy 1: Direct parsing (including handling extra data)"""
+        try:
+            json.loads(content)
+            return content
+        except json.JSONDecodeError as e:
+            if "Extra data" in str(e):
+                return self._extract_first_json(content)
+            raise
+
+    def _extract_from_code_block(self, content: str) -> str:
+        """Strategy 2: Extract JSON from code block"""
+        match = re.search(r"```json\s*(.*?)\s*```", content, re.DOTALL)
+        if not match:
+            raise json.JSONDecodeError("No JSON code block found", content, 0)
+
+        json_content = match.group(1).strip()
+        return self._direct_parse(json_content)
+
+    def _fix_python_syntax(self, content: str) -> str:
+        """Strategy 3: Fix Python syntax before parsing"""
+        fixed = self._fix_python_booleans(content)
+        return self._direct_parse(fixed)
+
+    def _extract_with_fix_combined(self, content: str) -> str:
+        """Strategy 4: Combined strategy - fix Python syntax first, then extract the first JSON object"""
+        fixed = self._fix_python_booleans(content)
+
+        # Try to extract code block from the fixed content
+        match = re.search(r"```json\s*(.*?)\s*```", fixed, re.DOTALL)
+        if match:
+            fixed = match.group(1).strip()
+
+        return self._direct_parse(fixed)
+
+    @staticmethod
+    def _fix_python_booleans(json_str: str) -> str:
+        """Safely fix Python-style booleans to JSON standard format using tokenize"""
+        replacements = {"True": "true", "False": "false", "None": "null"}
+
+        try:
+            out = []
+            io_string = io.StringIO(json_str)
+            tokens = tokenize.generate_tokens(io_string.readline)
+
+            for toknum, tokval, _, _, _ in tokens:
+                if toknum == tokenize.NAME and tokval in replacements:
+                    out.append(replacements[tokval])
+                else:
+                    out.append(tokval)
+
+            result = "".join(out)
+            return result
+
+        except (tokenize.TokenError, json.JSONDecodeError):
+            # If tokenize fails, fallback to regex method
+            for python_val, json_val in replacements.items():
+                json_str = re.sub(rf"\b{python_val}\b", json_val, json_str)
+            return json_str
+
+    @staticmethod
+    def _extract_first_json(response: str) -> str:
+        """Extract the first complete JSON object, ignoring extra content"""
+        decoder = json.JSONDecoder()
+        obj, _ = decoder.raw_decode(response)
+        return json.dumps(obj)
 
 
 class SQliteLazyCache(SingletonBaseClass):
@@ -153,13 +258,17 @@ class ChatSession:
         messages = self.build_chat_completion_message(user_prompt)
 
         with logger.tag(f"session_{self.conversation_id}"):
+            start_time = datetime.now(pytz.timezone("Asia/Shanghai"))
             response: str = self.api_backend._try_create_chat_completion_or_embedding(  # noqa: SLF001
                 *args,
                 messages=messages,
                 chat_completion=True,
                 **kwargs,
             )
-            logger.log_object({"user": user_prompt, "resp": response}, tag="debug_llm")
+            end_time = datetime.now(pytz.timezone("Asia/Shanghai"))
+            logger.log_object(
+                {"user": user_prompt, "resp": response, "start": start_time, "end": end_time}, tag="debug_llm"
+            )
 
         messages.append(
             {
@@ -275,6 +384,23 @@ class APIBackend(ABC):
         *args,
         **kwargs,
     ) -> str:
+        """
+        Responseible for building messages and logging messages
+
+        TODO: What is weird is that the function is called before we seperate embeddings and chat completion.
+
+        Parameters
+        ----------
+        user_prompt : str
+        system_prompt : str | None
+        former_messages : list | None
+        response_format : BaseModel | dict
+            A BaseModel based on pydantic or a dict
+        **kwargs
+        Returns
+        -------
+        str
+        """
         if former_messages is None:
             former_messages = []
         messages = self._build_messages(
@@ -284,6 +410,7 @@ class APIBackend(ABC):
             shrink_multiple_break=shrink_multiple_break,
         )
 
+        start_time = datetime.now(pytz.timezone("Asia/Shanghai"))
         resp = self._try_create_chat_completion_or_embedding(  # type: ignore[misc]
             *args,
             messages=messages,
@@ -291,9 +418,13 @@ class APIBackend(ABC):
             chat_cache_prefix=chat_cache_prefix,
             **kwargs,
         )
+        end_time = datetime.now(pytz.timezone("Asia/Shanghai"))
         if isinstance(resp, list):
             raise ValueError("The response of _try_create_chat_completion_or_embedding should be a string.")
-        logger.log_object({"system": system_prompt, "user": user_prompt, "resp": resp}, tag="debug_llm")
+        logger.log_object(
+            {"system": system_prompt, "user": user_prompt, "resp": resp, "start": start_time, "end": end_time},
+            tag="debug_llm",
+        )
         return resp
 
     def create_embedding(self, input_content: str | list[str], *args, **kwargs) -> list[float] | list[list[float]]:  # type: ignore[no-untyped-def]
@@ -336,6 +467,7 @@ class APIBackend(ABC):
         max_retry = LLM_SETTINGS.max_retry if LLM_SETTINGS.max_retry is not None else max_retry
         timeout_count = 0
         violation_count = 0
+        embedding_truncated = False  # Track if we've already tried truncation
         for i in range(max_retry):
             API_start_time = datetime.now()
             try:
@@ -349,10 +481,28 @@ class APIBackend(ABC):
                     or "\\'messages\\' must contain the word \\'json\\' in some form" in e.message
                 ):
                     kwargs["add_json_in_prompt"] = True
-                elif hasattr(e, "message") and embedding and "maximum context length" in e.message:
-                    kwargs["input_content_list"] = [
-                        content[: len(content) // 2] for content in kwargs.get("input_content_list", [])
-                    ]
+
+                too_long_error_message = hasattr(e, "message") and (
+                    "maximum context length" in e.message or "input must have less than" in e.message
+                )
+
+                if embedding and too_long_error_message:
+                    if not embedding_truncated:
+                        # Handle embedding text too long error - truncate once and retry
+                        model_name = LLM_SETTINGS.embedding_model
+                        logger.warning(f"Embedding text too long for model {model_name}, truncating content")
+
+                        # Apply truncation to content list and continue to retry
+                        original_content_list = kwargs.get("input_content_list", [])
+                        kwargs["input_content_list"] = truncate_content_list(original_content_list, model_name)
+                        embedding_truncated = True  # Mark that we've tried truncation
+                        # Continue to next iteration to retry embedding with truncated content
+                    else:
+                        # Already tried truncation, raise error with guidance
+                        raise RuntimeError(
+                            f"Embedding failed even after truncation. "
+                            f"Please set LLM_SETTINGS.embedding_max_length to a smaller value."
+                        ) from e
                 else:
                     RD_Agent_TIMER_wrapper.api_fail_count += 1
                     RD_Agent_TIMER_wrapper.latest_api_fail_time = datetime.now(pytz.timezone("Asia/Shanghai"))
@@ -417,11 +567,15 @@ class APIBackend(ABC):
         seed: Optional[int] = None,
         json_target_type: Optional[str] = None,
         add_json_in_prompt: bool = False,
+        response_format: Optional[Union[dict, Type[BaseModel]]] = None,
         **kwargs: Any,
     ) -> str:
         """
         Call the chat completion function and automatically continue the conversation if the finish_reason is length.
         """
+
+        if response_format is None and json_mode:
+            response_format = {"type": "json_object"}
 
         # 0) return directly if cache is hit
         if seed is None and LLM_SETTINGS.use_auto_chat_cache_seed_gen:
@@ -443,12 +597,15 @@ class APIBackend(ABC):
         new_messages = deepcopy(messages)
         # Loop to get a full response
         try_n = 6
+        # Before retry loop, initialize the flag
+        json_added = False
         for _ in range(try_n):  # for some long code, 3 times may not enough for reasoning models
-            if json_mode and add_json_in_prompt:
+            if response_format == {"type": "json_object"} and add_json_in_prompt and not json_added:
                 self._add_json_in_prompt(new_messages)
+                json_added = True
             response, finish_reason = self._create_chat_completion_inner_function(
                 messages=new_messages,
-                json_mode=json_mode,
+                response_format=response_format,
                 **kwargs,
             )
             all_response += response
@@ -460,18 +617,33 @@ class APIBackend(ABC):
 
         # 2) refine the response and return
         if LLM_SETTINGS.reasoning_think_rm:
+            # Strategy 1: Try to match complete <think>...</think> pattern
             match = re.search(r"<think>(.*?)</think>(.*)", all_response, re.DOTALL)
-            _, all_response = match.groups() if match else ("", all_response)
+            if match:
+                _, all_response = match.groups()
+            else:
+                # Strategy 2: If no complete match, try to match only </think>
+                match = re.search(r"</think>(.*)", all_response, re.DOTALL)
+                if match:
+                    all_response = match.group(1)
+                # If no match at all, keep original content
 
-        if json_mode:
-            try:
-                json.loads(all_response)
-            except json.decoder.JSONDecodeError:
-                match = re.search(r"```json(.*)```", all_response, re.DOTALL)
-                all_response = match.groups()[0] if match else all_response
-                json.loads(all_response)
-        if json_target_type is not None:
-            TypeAdapter(json_target_type).validate_json(all_response)
+        # 3) format checking
+        if response_format == {"type": "json_object"} or json_target_type:
+            parser = JSONParser(add_json_in_prompt=add_json_in_prompt)
+            all_response = parser.parse(all_response)
+            if json_target_type:
+                # deepseek will enter this branch
+                TypeAdapter(json_target_type).validate_json(all_response)
+
+        if response_format is not None:
+            if not isinstance(response_format, dict) and issubclass(response_format, BaseModel):
+                # It may raise TypeError if initialization fails
+                response_format(**json.loads(all_response))
+            elif response_format == {"type": "json_object"}:
+                logger.info(f"Using OpenAI response format: {response_format}")
+            else:
+                logger.warning(f"Unknown response_format: {response_format}, skipping validation.")
         if self.dump_chat_cache:
             self.cache.chat_set(input_content_json, all_response)
         return all_response
@@ -500,6 +672,13 @@ class APIBackend(ABC):
         return [content_to_embedding_dict[content] for content in input_content_list]  # type: ignore[misc]
 
     @abstractmethod
+    def supports_response_schema(self) -> bool:
+        """
+        Check if the backend supports function calling
+        """
+        raise NotImplementedError("Subclasses must implement this method")
+
+    @abstractmethod
     def _calculate_token_from_messages(self, messages: list[dict[str, Any]]) -> int:
         """
         Calculate the token count from messages
@@ -507,9 +686,7 @@ class APIBackend(ABC):
         raise NotImplementedError("Subclasses must implement this method")
 
     @abstractmethod
-    def _create_embedding_inner_function(  # type: ignore[no-untyped-def]
-        self, input_content_list: list[str], *args, **kwargs
-    ) -> list[list[float]]:  # noqa: ARG002
+    def _create_embedding_inner_function(self, input_content_list: list[str]) -> list[list[float]]:
         """
         Call the embedding function
         """
@@ -519,7 +696,7 @@ class APIBackend(ABC):
     def _create_chat_completion_inner_function(  # type: ignore[no-untyped-def] # noqa: C901, PLR0912, PLR0915
         self,
         messages: list[dict[str, Any]],
-        json_mode: bool = False,
+        response_format: Optional[Union[dict, Type[BaseModel]]] = None,
         *args,
         **kwargs,
     ) -> tuple[str, str | None]:
@@ -527,3 +704,7 @@ class APIBackend(ABC):
         Call the chat completion function
         """
         raise NotImplementedError("Subclasses must implement this method")
+
+    @property
+    def chat_token_limit(self) -> int:
+        return LLM_SETTINGS.chat_token_limit

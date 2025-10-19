@@ -43,16 +43,19 @@ class FeatureCoSTEEREvaluator(CoSTEEREvaluator):
                 final_decision=False,
             )
 
-        env = get_ds_env(extra_volumes={self.scen.debug_path: T("scenarios.data_science.share:scen.input_path").r()})
+        env = get_ds_env(
+            extra_volumes={self.scen.debug_path: T("scenarios.data_science.share:scen.input_path").r()},
+            running_timeout_period=self.scen.real_debug_timeout(),
+        )
 
         # TODO: do we need to clean the generated temporary content?
         fname = "test/feature_test.py"
         test_code = (DIRNAME / "eval_tests" / "feature_test.txt").read_text()
         implementation.inject_files(**{fname: test_code})
 
-        stdout, ret_code = implementation.execute_ret_code(env=env, entry=f"python {fname}")
+        result = implementation.run(env=env, entry=f"python {fname}")
 
-        if "main.py" in implementation.file_dict and ret_code == 0:
+        if "main.py" in implementation.file_dict and result.exit_code == 0:
             workflow_stdout = implementation.execute(env=env, entry="python main.py")
             workflow_stdout = remove_eda_part(workflow_stdout)
         else:
@@ -66,7 +69,7 @@ class FeatureCoSTEEREvaluator(CoSTEEREvaluator):
             workflow_code=implementation.all_codes,
         )
         user_prompt = T(".prompts:feature_eval.user").r(
-            stdout=shrink_text(stdout),
+            stdout=result.get_truncated_stdout(),
             workflow_stdout=workflow_stdout,
         )
 
@@ -76,6 +79,6 @@ class FeatureCoSTEEREvaluator(CoSTEEREvaluator):
             user_prompt=user_prompt,
             init_kwargs_update_func=FeatureEvalFeedback.val_and_update_init_dict,
         )
-        fb.final_decision = fb.final_decision and ret_code == 0
+        fb.final_decision = fb.final_decision and result.exit_code == 0
 
         return fb
