@@ -21,6 +21,8 @@ class TestRDAgentImports(unittest.TestCase):
                 continue
             if "meta_tpl" in fstr:
                 continue
+            if "autorl_bench/workspace/" in fstr:
+                continue
             if "template" in fstr or "tpl" in fstr:
                 continue
             if "model_coder" in fstr:
@@ -35,6 +37,11 @@ class TestRDAgentImports(unittest.TestCase):
                 or fstr.endswith("rdagent/log/ui/utils.py")
             ):
                 # the entrance points
+                continue
+            # llamafactory==0.9.3 pins numpy to an older version, causing other
+            # installations to fail. The `extract_parameters` tests are therefore
+            # temporarily disabled and can be re-enabled once the numpy constraint is relaxed.
+            if "extract_parameters" in fstr:
                 continue
 
             yield fstr[fstr.index("rdagent") : -3].replace("/", ".")

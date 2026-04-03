@@ -126,6 +126,9 @@ class FactorReportLoop(FactorRDLoop, metaclass=LoopMeta):
                 ]
                 exp.sub_workspace_list = exp.sub_workspace_list[: FACTOR_FROM_REPORT_PROP_SETTING.max_factors_per_exp]
                 exp.sub_tasks = exp.sub_tasks[: FACTOR_FROM_REPORT_PROP_SETTING.max_factors_per_exp]
+                exp.base_features = self.plan["features"]
+                if exp.based_experiments:
+                    exp.based_experiments[-1].base_features = self.plan["features"]
                 logger.log_object(exp.hypothesis, tag="hypothesis generation")
                 logger.log_object(exp.sub_tasks, tag="experiment generation")
                 return exp
@@ -135,23 +138,6 @@ class FactorReportLoop(FactorRDLoop, metaclass=LoopMeta):
         exp = self.coder.develop(prev_out["direct_exp_gen"])
         logger.log_object(exp.sub_workspace_list, tag="coder result")
         return exp
-
-    def feedback(self, prev_out: dict[str, Any]):
-        e = prev_out.get(self.EXCEPTION_KEY, None)
-        if e is not None:
-            feedback = HypothesisFeedback(
-                observations=str(e),
-                hypothesis_evaluation="",
-                new_hypothesis="",
-                reason="",
-                decision=False,
-            )
-            logger.log_object(feedback, tag="feedback")
-            self.trace.hist.append((prev_out["direct_exp_gen"]["exp_gen"], feedback))
-        else:
-            feedback = self.summarizer.generate_feedback(prev_out["running"], self.trace)
-            logger.log_object(feedback, tag="feedback")
-            self.trace.hist.append((prev_out["running"], feedback))
 
 
 def main(report_folder=None, path=None, all_duration=None, checkout=True):
